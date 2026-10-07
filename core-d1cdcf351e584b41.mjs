@@ -20,7 +20,7 @@ export function checkRequest(frame,model){
   return {...body,store:false};
 }
 export function ownedScan(table,workspaceId,id){const scan=table.get(id);if(!scan||scan.workspaceId!==workspaceId)throw Error('Scan not found in this workspace');return scan;}
-export function dockerArgs({image,repo,state,name,seccomp=fileURLToPath(new URL('./engine/seccomp.json',import.meta.url))}){
+export function dockerArgs({image,repo,state,name,seccomp=fileURLToPath(new URL('./seccomp-d1cdcf351e584b41.json',import.meta.url))}){
   if(!/^sha256:[a-f0-9]{64}$/.test(image))throw Error('A verified immutable scanner image is required');
   for(const value of [repo,state])if(!path.isAbsolute(value)||/[\r\n,]/.test(value))throw Error('Unsafe Docker mount path');
   const uid=process.getuid?.()??1000,gid=process.getgid?.()??1000;if(uid===0)throw Error('Run Harness as a non-root user');

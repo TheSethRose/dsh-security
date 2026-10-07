@@ -106,3 +106,36 @@ test('default reasoning effort applies only to matching tuple on start and valid
 test('invalid or removed tuple disables Start instead of falling back',async()=>{
  const p=mount();await p.flush();p.change(modelSelect(p),selectionValue('unknown','custom-model'));p.change(p.input('checkbox'),true);assert.equal(p.button('Start scan').props.disabled,true);assert.equal(p.requests.filter(r=>r.args.operation==='start').length,0);p.unmount();
 });
+
+const failedScan={...completed,id:'failed-a',status:'failed',findings:0,result:undefined,error:'INVALID_REQUEST',diagnostics:[{kind:'gateway',at:'2026-10-06T00:00:00Z',requestId:'local-request',stage:'iterate',outcome:'failed',code:'INVALID_REQUEST',reason:'ambiguous_request_rejection',requestBytes:2048}]};
+test('bulk and row removal are visible, explicitly confirmed, snapshot-scoped and clear stale detail',async()=>{
+ let rows=[failedScan,completed];const p=mount({route:a=>a.operation==='list'?rows:a.operation==='get'?failedScan:a.operation==='clear_failed'?(rows=rows.filter(row=>!a.ids.includes(row.id)),{removed:a.ids}):undefined});await p.flush();
+ assert.ok(p.button('Remove'));p.click(historyButton(p));await p.flush();assert.ok(p.button('Remove failed scan'));
+ p.click(p.button('Clear failed scans (1)'));assert.ok(p.button('Keep scans'));assert.match(p.text(),/Private engine files on disk are retained/);assert.equal(p.requests.some(r=>r.args.operation==='clear_failed'),false);p.click(p.button('Keep scans'));assert.equal(p.button('Remove failed scans'),undefined);
+ p.click(p.button('Remove failed scan'));rows=[...rows,{...failedScan,id:'new-failure'}];p.click(p.button('Remove failed scans'));await p.flush();
+ const req=p.requests.find(r=>r.args.operation==='clear_failed');assert.deepEqual(req.args,{operation:'clear_failed',workspaceId:'workspace-a',ids:['failed-a'],userRequested:true});assert.equal(req.options.headers['X-DSH-Security-CSRF'],'test-only-panel-token');assert.match(p.text(),/Removed 1 failed scan from history/);assert.ok(p.text().includes('new-failure')===false);assert.equal(p.button('Download diagnostics'),undefined,'deleted selected detail cleared');assert.ok(p.button('Clear failed scans (1)'),'new failure retained');assert.ok(p.text().includes('completed'));
+ p.click(p.button('Remove'));assert.ok(p.button('Remove failed scans'));p.change(workspaceSelect(p),'workspace-b');assert.equal(p.button('Remove failed scans'),undefined);p.unmount();
+});
+
+test('empty history after clearing cannot be resurrected by an older poll',async()=>{
+ const old=deferred();let lists=0,removed=false;const p=mount({route:a=>a.operation==='list'?(++lists===2?old.promise:removed?[]:[failedScan]):a.operation==='get'?failedScan:a.operation==='clear_failed'?(removed=true,{removed:a.ids}):undefined});await p.flush();p.click(historyButton(p));await p.flush();p.tick();await p.flush();p.click(p.button('Clear failed scans (1)'));p.click(p.button('Remove failed scans'));await p.flush();assert.match(p.text(),/No scans for this workspace/);
+ old.resolve([failedScan]);await p.flush();assert.match(p.text(),/No scans for this workspace/);assert.equal(p.button('Clear failed scans (1)'),undefined);assert.equal(p.button('Download diagnostics'),undefined);p.unmount();
+});
+
+test('removal displays pending and retryable error states without clearing entries or consent',async()=>{
+ const pending=deferred();const p=mount({history:[failedScan],route:a=>a.operation==='clear_failed'?pending.promise:undefined});await p.flush();p.change(p.input('checkbox'),true);p.click(p.button('Remove'));p.click(p.button('Remove failed scans'));assert.match(p.text(),/Removing failed scans/);assert.equal(p.button('Remove failed scans').props.disabled,true);pending.reject(Error('Scan cleanup is still pending'));await p.flush();assert.match(p.text(),/Scan cleanup is still pending/);assert.equal(p.button('Remove failed scans').props.disabled,false);assert.equal(p.input('checkbox').props.checked,true);assert.ok(p.button('Remove'));p.unmount();
+});
+
+test('partial deletion error refreshes remaining history, detail and confirmation snapshot',async()=>{
+ let rows=[failedScan,{...failedScan,id:'failed-b'}];const p=mount({route:a=>a.operation==='list'?rows:a.operation==='get'?failedScan:a.operation==='clear_failed'?(rows=rows.slice(1),Promise.reject(Error('storage unavailable'))):undefined});await p.flush();p.click(historyButton(p));await p.flush();p.click(p.button('Clear failed scans (2)'));p.click(p.button('Remove failed scans'));await p.flush();assert.match(p.text(),/storage unavailable/);assert.match(p.text(),/Remove 1 failed scan\?/);assert.equal(p.button('Download diagnostics'),undefined);assert.ok(p.button('Clear failed scans (1)'));p.unmount();
+});
+
+test('selected running poll cannot restore a failed detail deleted before effect cleanup',async()=>{
+ const old=deferred();let gets=0,removed=false;const running={...failedScan,status:'running'};
+ const p=mount({route:a=>a.operation==='list'?(removed?(old.resolve(failedScan),[]):[failedScan]):a.operation==='get'?(++gets===1?running:old.promise):a.operation==='clear_failed'?(removed=true,{removed:a.ids}):undefined});await p.flush();p.click(historyButton(p));await p.flush();p.tick();await p.flush();
+ p.click(p.button('Clear failed scans (1)'));p.click(p.button('Remove failed scans'));await p.flush();assert.equal(p.button('Download diagnostics'),undefined);assert.equal(p.button('Cancel scan'),undefined);assert.match(p.text(),/No scans for this workspace/);p.unmount();
+});
+
+test('diagnostic downloads include only sanitized log data, not report/error/progress or authorization',async()=>{
+ const secret='TEST-ONLY-SOURCE-CREDENTIAL-CANARY',row={...failedScan,error:secret,events:[secret],result:{report:secret},diagnosticsDropped:2};const p=mount({history:[row],route:a=>a.operation==='get'?row:undefined});await p.flush();p.click(historyButton(p));await p.flush();assert.match(p.text(),/Diagnostic log \(1\)/);p.click(p.button('Download diagnostics'));await p.flush();const blob=await p.blobs[0].text();assert.deepEqual(JSON.parse(blob),{version:1,scanId:row.id,diagnosticsDropped:2,diagnostics:row.diagnostics});assert.ok(!blob.includes(secret));assert.ok(!blob.includes('test-only-panel-token'));assert.equal(p.downloads[0].download,'security-failed-a-diagnostics.json');p.runTimeouts();assert.equal(p.revoked.length,1);assert.equal(p.requests.some(r=>['start','validate','export'].includes(r.args.operation)),false);p.unmount();
+});

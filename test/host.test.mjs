@@ -7,7 +7,7 @@ async function harness(options={}){
  const maps={scans:new Map(options.scans??[]),leases:new Map(options.leases??[])},effects=[],calls=[],jobs=[],engines=new Map(),logs=[];let tool,handler,spec,closed=false;
  const models=[{provider:'deepseek',id:'deepseek-v4-pro',name:'Fixture model'},{provider:'other',id:'custom-model',name:'Fixture model'}];
  const started=deferred();const ctx={
-  storageDomain:{open:async value=>{spec=value;return {table:name=>({get:id=>{const v=maps[name].get(id);return v===undefined?undefined:structuredClone(v);},entries:()=>[...maps[name]].map(([k,v])=>[k,structuredClone(v)])[Symbol.iterator](),put:async(id,row)=>{const value=spec.tables[name].valueSchema.parse(row);await options.put?.(name,id,value);maps[name].set(id,structuredClone(value));},delete:async id=>maps[name].delete(id)}),close:async()=>{closed=true;}};}},
+  storageDomain:{open:async value=>{spec=value;return {table:name=>({get:id=>{const v=maps[name].get(id);return v===undefined?undefined:structuredClone(v);},entries:()=>[...maps[name]].map(([k,v])=>[k,structuredClone(v)])[Symbol.iterator](),put:async(id,row)=>{const value=spec.tables[name].valueSchema.parse(row);await options.put?.(name,id,value);maps[name].set(id,structuredClone(value));},delete:async id=>{await options.delete?.(name,id);return maps[name].delete(id);}}),close:async()=>{closed=true;}};}},
   workspaceRegistry:{get:id=>workspaces.find(w=>w.id===id),list:()=>workspaces},
   tools:{register:value=>{tool=value;return ()=>{};}},llm:{listProviders:()=>[{id:'deepseek',name:'DeepSeek'},{id:'other',name:'Other adapter'}],listModels:async provider=>options.adapterCatalog?options.adapterCatalog(provider):models.filter(m=>m.provider===provider),resolveModelInfo:async(provider,model,signal)=>options.resolveModel?options.resolveModel(provider,model,signal):{provider,id:model,name:'Fixture model',context:{contextWindow:131072},reasoning:{efforts:[{id:'high'}]}},prepareCall:async(config,signal)=>{options.prepared?.(config,signal);return {config:{...config},stream:async function*(call){options.stream?.(call);yield {type:'finish',reason:{kind:'stop'}};}}}},sessionController:{modelCatalog:async()=>options.nativeCatalog?options.nativeCatalog():{default:options.defaultSelection??{provider:'deepseek',model:'deepseek-v4-pro'},routableProviders:['deepseek','other'],groups:[{id:'deepseek',name:'DeepSeek',models:models.filter(m=>m.provider==='deepseek').map(({provider,...model})=>model)},{id:'other',name:'Other adapter',models:models.filter(m=>m.provider==='other').map(({provider,...model})=>model)}],failures:[]}},
   subprocess:{resolveExecutable:async command=>{assert.equal(command,process.env.DSH_SECURITY_DOCKER??'docker');if(options.resolveError)throw Error('Docker unavailable');return '/docker';},spawn:spawnSpec=>{
@@ -22,7 +22,7 @@ async function harness(options={}){
    return {done:Promise.resolve(response).then(v=>({exitCode:v.exitCode??0})),collected:{stdout:{readFrom:()=>({text:response.output??''})},stderr:{readFrom:()=>({text:response.text??''})}}};
   }},
   connection:{requestRejection:()=>options.rejection??undefined},webServer:{register:value=>{handler=value.handler;return ()=>{};}},
-  effect:setup=>{const disposer=setup();effects.push(disposer);return disposer;},logger:{error:(...args)=>{logs.push(args);options.log?.(...args);}}
+  effect:setup=>{const disposer=setup();effects.push(disposer);return disposer;},logger:Object.fromEntries(['error','warn','info'].map(level=>[level,(...args)=>{logs.push(args);if(level==='error')options.log?.(...args);options.diagnosticLog?.(level,...args);}]))
  };
  const h={repo,state,ctx,maps,calls,jobs,logs,started:started.promise,get closed(){return closed;},get tool(){return tool;},get handler(){return handler;},get spec(){return spec;},async init(){await apply(ctx);h.panelToken=(await h.http({operation:'workspaces'})).panelToken;return h;},async shutdown(){for(const effect of [...effects].reverse())await effect?.();},
   async invoke(args,session='session-a'){return tool.execute(args,{signal:new AbortController().signal,agent:{id:session}});},
@@ -165,4 +165,47 @@ test('native catalog failure fails closed and sanitizes status and HTTP response
 test('adapter model metadata errors are sanitized before HTTP responses',async t=>{
  const secret='TEST-ONLY-NOT-A-REAL-KEY';const h=await (await harness({resolveModel:async()=>{throw Error(`metadata unavailable ${secret}`);}})).init();t.after(()=>h.shutdown());
  const reply=await h.http(startArgs);assert.equal(reply.status,400);assert.match(reply.error,/model metadata is unavailable/);assert.ok(!JSON.stringify(reply).includes(secret));assert.equal(h.calls.length,0);assert.equal(h.maps.scans.size,0);assert.equal((await h.invoke({operation:'status'})).active,false);
+});
+
+test('failed history removal requires confirmed UI CSRF and preserves other statuses/workspaces/state',async t=>{
+ const h=await harness();t.after(()=>h.shutdown());const failed=randomUUID(),success=randomUUID(),foreign=randomUUID(),cancelled=randomUUID();
+ for(const [id,wid,status]of [[failed,'workspace-a','failed'],[success,'workspace-a','completed'],[foreign,'workspace-b','failed'],[cancelled,'workspace-a','cancelled']])h.maps.scans.set(id,{...completed(id,wid,h.state),status});
+ await h.init();const args={operation:'clear_failed',workspaceId:'workspace-a',ids:[failed],userRequested:true};
+ await assert.rejects(h.invoke(args),/must be one of/);
+ for(const token of [undefined,'wrong'])assert.equal((await h.http(args,{'x-dsh-security-csrf':token})).status,403);
+ assert.equal((await h.http({...args,userRequested:false})).status,400);
+ for(const id of [success,foreign,cancelled]){assert.equal((await h.http({...args,ids:[failed,id]})).status,400);assert.ok(h.maps.scans.has(failed),'entire snapshot checked before deletion');}
+ assert.equal((await h.http({...args,ids:[]})).status,400);
+ const reply=await h.http({...args,ids:[failed,failed]});assert.equal(reply.status,200);assert.deepEqual(reply.result,{removed:[failed]});
+ assert.equal(h.maps.scans.has(failed),false);for(const id of [success,foreign,cancelled])assert.ok(h.maps.scans.has(id));
+ assert.equal(h.calls.length,0,'no engine command or private file cleanup');
+ const restarted=await (await harness({scans:[...h.maps.scans]})).init();t.after(()=>restarted.shutdown());assert.equal((await restarted.invoke({operation:'list'})).some(row=>row.id===failed),false);
+});
+
+test('storage delete errors expose partial removal without deleting unrelated history',async t=>{
+ const ids=[randomUUID(),randomUUID()],h=await (await harness({scans:ids.map(id=>[id,{...completed(id,'workspace-a','/private/state'),status:'failed'}]),delete:async(name,id)=>{if(name==='scans'&&id===ids[1])throw Error('storage unavailable');}})).init();t.after(()=>h.shutdown());
+ assert.equal((await h.http({operation:'clear_failed',workspaceId:'workspace-a',ids,userRequested:true})).status,400);assert.equal(h.maps.scans.has(ids[0]),false);assert.equal(h.maps.scans.has(ids[1]),true);assert.deepEqual((await h.invoke({operation:'list'})).map(row=>row.id),[ids[1]]);
+});
+
+test('failed entry with outstanding lease or finishing task is not removable',async t=>{
+ const id=randomUUID(),row={...completed(id,'workspace-a','/private/state'),status:'failed'};
+ const h=await (await harness({scans:[[id,row]],leases:[[id,{id,name:'dsh-security-'+id,image:'sha256:'+'a'.repeat(64),state:row.state,phase:'creating',createdAt:row.createdAt}]],command:a=>a[0]==='inspect'?{exitCode:1,text:'No such container'}:undefined})).init();t.after(()=>h.shutdown());
+ assert.match((await h.http({operation:'clear_failed',workspaceId:'workspace-a',ids:[id],userRequested:true})).error,/cleanup is still pending/);assert.ok(h.maps.scans.has(id));
+ const held=deferred(),finishing=deferred();const live=await (await harness({request:true,stream:()=>{throw Object.assign(Error('private adapter message'),{code:'INVALID_REQUEST'});},put:async(name,_id,r)=>{if(name==='scans'&&r.status==='failed'){live.maps.scans.set(_id,structuredClone(r));finishing.resolve();await held.promise;}}})).init();t.after(()=>live.shutdown());
+ const started=await live.http(startArgs);await finishing.promise;
+ assert.equal((await live.http({operation:'clear_failed',workspaceId:'workspace-a',ids:[started.result.id],userRequested:true})).status,400);held.resolve();await live.shutdown();
+ assert.equal((await live.invoke({operation:'status'})).active,false);
+});
+
+test('gateway and engine diagnostics persist through failure, exclude secrets and isolate logger failures',async t=>{
+ const secret='TEST-ONLY-SOURCE-AND-CREDENTIAL-CANARY';
+ const h=await (await harness({request:true,stream:()=>{throw Object.assign(Error(secret),{code:'INVALID_REQUEST',status:413,requestId:secret});},diagnosticLog:()=>{throw Error(secret);}})).init();t.after(()=>h.shutdown());
+ const started=await h.http(startArgs);await h.started;for(let n=0;n<20&&(await h.invoke({operation:'status'})).active;n++)await turn();
+ const row=await h.invoke({operation:'get',id:started.result.id});assert.equal(row.status,'failed');assert.equal(row.diagnostics.length,2);
+ const gateway=row.diagnostics.find(d=>d.kind==='gateway');assert.equal(gateway.stage,'iterate');assert.equal(gateway.code,'INVALID_REQUEST');assert.equal(gateway.upstreamStatus,413);assert.equal(gateway.reason,'size_rejection');assert.equal(gateway.contextWindow,131072);
+ assert.ok(!JSON.stringify(row.diagnostics).includes(secret));assert.ok(!JSON.stringify(h.logs).includes(secret));assert.ok(!JSON.stringify(row).includes(h.panelToken));
+ assert.equal(Object.hasOwn((await h.invoke({operation:'list'}))[0],'diagnostics'),false);
+ const schema=h.spec.tables.scans.valueSchema;assert.equal(schema.safeParse({...row,diagnostics:Array(129).fill(gateway)}).success,false);
+ assert.equal(schema.safeParse({...row,diagnostics:[{...gateway,message:secret}]}).success,false);assert.equal(schema.safeParse({...row,diagnostics:[{...gateway,requestBytes:-1}]}).success,false);
+ const restored=await (await harness({scans:[...h.maps.scans]})).init();t.after(()=>restored.shutdown());assert.deepEqual((await restored.invoke({operation:'get',id:row.id})).diagnostics,row.diagnostics);
 });

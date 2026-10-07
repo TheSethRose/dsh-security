@@ -97,3 +97,13 @@ test('a stalled provider response body is abortable without cooperative iterator
  const controller=new AbortController(),entered=deferred(),f=fake({script:({emit})=>emit(request())});const body={[Symbol.asyncIterator](){return {next(){entered.resolve();return new Promise(()=>{});}};}};
  const task=runEngine(args(f,{signal:controller.signal,gateway:async()=>({status:200,headers:new Headers(),body})}));await entered.promise;controller.abort();await assert.rejects(task,/cancel/i);assert.equal(f.calls.at(-1)[0],'rm');
 });
+
+test('engine terminal diagnostics are safe, single and unaffected by observer exceptions',async()=>{
+ const diagnostics=[],secret='TEST-ONLY-PRIVATE-ENGINE-STDERR';const f=fake({stderr:secret,script:({emit,finish})=>{emit(request());emit({type:'result',value:'ok'});finish();}});
+ assert.equal(await runEngine(args(f,{onDiagnostic:d=>{diagnostics.push(d);throw Error(secret);}})),'ok');assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].stage,'complete');assert.equal(diagnostics[0].outcome,'completed');assert.equal(diagnostics[0].requestCount,1);assert.equal(diagnostics[0].peakActive,1);assert.ok(!JSON.stringify(diagnostics).includes(secret));
+});
+test('engine diagnostic records cleanup failure and pre-start cancellation without leaking Docker errors',async()=>{
+ const diagnostics=[],secret='TEST-ONLY-PRIVATE-DOCKER-ERROR',f=fake({script:({emit,finish})=>{emit({type:'result',value:'ok'});finish();},command:a=>a[0]==='rm'?{exitCode:1,text:secret}:undefined});
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>diagnostics.push(d)})),/cleanup failed/);assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].stage,'cleanup');assert.equal(diagnostics[0].outcome,'failed');assert.equal(diagnostics[0].reason,'engine_failure');assert.ok(!JSON.stringify(diagnostics).includes(secret));
+ const cancelled=[];await assert.rejects(runEngine(args(fake(),{signal:AbortSignal.abort(),onDiagnostic:d=>cancelled.push(d)})));assert.equal(cancelled.length,1);assert.equal(cancelled[0].stage,'create');assert.equal(cancelled[0].outcome,'cancelled');assert.equal(cancelled[0].reason,'abort');
+});
