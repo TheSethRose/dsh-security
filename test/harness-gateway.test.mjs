@@ -51,7 +51,7 @@ test('exact selected Harness route, options and native JSON without Host tools',
   assert.equal(body.status, 'completed');
   assert.equal(body.output[0].content[0].text, 'hello');
   assert.deepEqual(body.usage, { input_tokens: 2, output_tokens: 3, total_tokens: 5, input_tokens_details: { cached_tokens: 1 }, output_tokens_details: { reasoning_tokens: 2 } });
-  assert.deepEqual(f.prepares[0].config, selection);
+  assert.deepEqual(f.prepares[0].config, { ...selection, maxTokens: 50, temperature: 0.2 });
   assert.equal(f.streams.length, 1);
   assert.equal(f.streams[0].system, 'system');
   assert.equal(f.streams[0].maxTokens, 50);
@@ -182,6 +182,64 @@ test('terminal errors and thrown adapter failures are sanitized with no retry or
   const response = await gateway(request());
   assert.equal(response.status, 502);
   assert.ok(!(await response.text()).includes('secret-token'));
+});
+
+test('allowlisted Harness failure codes survive preparation, dispatch and terminal failure without raw diagnostics', async () => {
+  for (const code of ['AUTH', 'RATE_LIMIT', 'QUOTA_EXCEEDED', 'CONTEXT_WINDOW_EXCEEDED', 'INVALID_PREPARED_CALL', 'PI_AI_ERROR', 'TIMEOUT', 'TRANSPORT', 'SERVER', 'INVALID_REQUEST', 'secret-token']) {
+    const error = Object.assign(new Error('credential=secret-token https://secret.invalid'), { code, headers: { authorization: 'secret-token' } });
+    for (const phase of ['prepare', 'dispatch', 'terminal']) {
+      let calls = 0;
+      const gateway = phase === 'terminal' ? fixture([{ type: 'finish', reason: { kind: 'error', failure: { code, message: error.message } } }]).gateway : createHarnessGateway({ selection, llm: { prepareCall(config) {
+        if (phase === 'prepare') throw error;
+        return { config, stream() { calls++; throw error; } };
+      } } });
+      const response = await gateway(request({ stream: phase === 'terminal' }));
+      const result = phase === 'terminal' ? (await parseSSE(response)).at(-1).response : await response.json();
+      assert.equal(result.status ?? 'failed', 'failed');
+      const message = result.error.message;
+      assert.ok(!message.includes('secret-token'));
+      assert.ok(!message.includes('secret.invalid'));
+      assert.equal(message.includes(`(${code})`), code !== 'secret-token');
+      assert.ok(calls <= 1);
+    }
+  }
+});
+
+test('adapter error diagnostics never evaluate code or failure accessors', async () => {
+  let reads = 0;
+  const error = new Error('secret-token');
+  for (const key of ['code', 'failure']) Object.defineProperty(error, key, { get() { reads++; throw new Error('secret-token'); } });
+  const gateway = createHarnessGateway({ selection, llm: { prepareCall() { throw error; } } });
+  const response = await gateway(request());
+  assert.equal(response.status, 502);
+  assert.ok(!(await response.text()).includes('secret-token'));
+  assert.equal(reads, 0);
+});
+
+test('authoritative final text may extend deltas without duplicating streamed text', async () => {
+  for (const partial of ['', 'hello', 'hello world']) {
+    const f = fixture([{ type: 'block-start', index: 0, blockType: 'text' }, { type: 'text-delta', index: 0, text: partial }, { type: 'block-end', index: 0, block: { type: 'text', text: 'hello world' } }, { type: 'finish', reason: { kind: 'stop' } }]);
+    const events = await parseSSE(await f.gateway(request({ stream: true })));
+    assert.equal(events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''), 'hello world');
+    assert.equal(events.at(-1).response.status, 'completed');
+    assert.equal(events.at(-1).response.output[0].content[0].text, 'hello world');
+  }
+});
+
+test('final text cannot silently rewrite already emitted deltas', async () => {
+  const chunks = textChunks('original');
+  chunks[2].block.text = 'replacement';
+  const events = await parseSSE(await fixture(chunks).gateway(request({ stream: true })));
+  assert.equal(events.at(-1).response.status, 'failed');
+  assert.equal(events.at(-1).response.error.message, 'Harness protocol translation failed: Adapter text completion differs from deltas.');
+});
+
+test('locally authored translation errors identify the failing invariant', async () => {
+  const f = fixture([{ type: 'block-start', index: 0, blockType: 'unknown-secret' }]);
+  const response = await f.gateway(request());
+  const body = await response.json();
+  assert.equal(body.error.message, 'Harness protocol translation failed: Unsupported adapter block.');
+  assert.ok(!body.error.message.includes('unknown-secret'));
 });
 
 test('max-tokens finish reports a native incomplete response', async () => {

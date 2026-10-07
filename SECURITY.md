@@ -1,6 +1,6 @@
 # Security boundaries and vulnerability reporting
 
-This is an experimental security-scanning integration. Scan findings are untrusted evidence, not proof of exploitability; an empty report is not a security guarantee. No paid inference or live detection-quality tests have been run for this integration.
+This is an experimental security-scanning integration. Scan findings are untrusted evidence, not proof of exploitability; an empty report is not a security guarantee. Real-provider end-to-end compatibility and live detection quality remain unverified; no paid inference was initiated by the implementation agent.
 
 ## Intended boundary
 
@@ -10,7 +10,7 @@ Provider/model choices and the default, including optional reasoning effort, com
 
 Native Codex speaks Responses to a container-local loopback endpoint. Framed requests cross container stdin/stdout to the Host transport, where `harness-gateway.mjs` translates them to `llm.prepareCall` and the prepared adapter stream. Existing Harness adapters own provider access and authentication. The bridge does not read raw credentials, directly forward to a fixed DeepSeek endpoint or require a separate plugin API key. The scanner's local credential command emits a dummy gateway token, not a provider credential. Fresh container state has no ambient Codex login, Host home, external MCP configuration, proxy or tracing configuration.
 
-Native engine tools execute only inside the container. The bridge translates local tool schemas/calls/results but never invokes Harness tools. Hosted external tools, remote background/storage and provider/model changes are rejected. A failed boundary check stops the operation; the bridge does not silently fall back to another provider/model. Native request/stream retries are disabled, but prepared adapters may retain their own retries. Sanitized failures, not raw adapter/provider error bodies, are exposed to the engine.
+Native engine tools execute only inside the container. The bridge translates local tool schemas/calls/results but never invokes Harness tools. Hosted external tools, remote background/storage and provider/model changes are rejected. A failed boundary check stops the operation; the bridge does not silently fall back to another provider/model. Native request/stream retries are disabled, but prepared adapters may retain their own retries. Sanitized failures, not raw adapter/provider error bodies, are exposed to the engine. Diagnostic messages contain only fixed allowlisted Harness failure categories or static bridge invariant messages; arbitrary provider codes, messages, stacks and accessors are not evaluated or copied. Validated token/temperature controls are bound before immutable Harness call preparation, not changed afterward.
 
 The Docker container has no external network, writable source, writable root image, added capabilities, privilege escalation, Docker socket or Host credential. It receives the approved workspace read-only, private writable report state and limited tmpfs scratch. Bubblewrap is a nested sandbox; the outer Docker boundary still applies even when the engine requests broader tool permissions. Custom seccomp allowances permit only the documented namespace/mount setup and do not grant outer kernel capabilities.
 
