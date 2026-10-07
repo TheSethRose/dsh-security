@@ -38,8 +38,18 @@ test('real defineTool/domain declarations enforce agent denial and content-block
 test('HTTP consent requires authenticated, custom-header, same-origin UI and checkbox',async t=>{
  const h=await (await harness()).init();t.after(()=>h.shutdown());
  assert.equal((await h.http(startArgs,{'x-dsh-security':undefined})).status,403);assert.equal((await h.http(startArgs,{origin:'http://evil.test'})).status,403);
- assert.match((await h.http(startArgs,{origin:undefined})).error,/same-origin Security panel/);assert.match((await h.http({...startArgs,userRequested:false})).error,/Explicit user authorization/);assert.equal(h.calls.length,0);
+ assert.match((await h.http(startArgs,{origin:undefined})).error,/could not be verified as coming from Harness/);assert.match((await h.http({...startArgs,userRequested:false})).error,/Explicit user authorization/);assert.equal(h.calls.length,0);
  const rejection=await (await harness({rejection:401})).init();t.after(()=>rejection.shutdown());assert.equal((await rejection.http(startArgs)).status,401);
+});
+test('same-origin browser metadata authorizes Origin-less Fetch but never bypasses consent',async t=>{
+ const h=await (await harness()).init();t.after(()=>h.shutdown());
+ const headers={origin:undefined,'sec-fetch-site':'same-origin'};
+ assert.match((await h.http({...startArgs,userRequested:false},headers)).error,/Explicit user authorization/);
+ assert.equal(h.calls.length,0);
+ for(const site of [undefined,'none','same-site','cross-site'])assert.match((await h.http(startArgs,{origin:undefined,'sec-fetch-site':site})).error,/could not be verified as coming from Harness/);
+ for(const origin of ['null','http://evil.test'])assert.equal((await h.http(startArgs,{origin,'sec-fetch-site':'same-origin'})).status,403);
+ assert.equal(h.calls.length,0);
+ const accepted=await h.http(startArgs,headers);assert.equal(accepted.status,200);assert.ok(accepted.result.id);await h.started;
 });
 test('ownership comes from execution session; foreign IDs and unregistered sessions are rejected',async t=>{
  const h=await harness();const id=randomUUID();h.maps.scans.set(id,completed(id,'workspace-b',h.state));await h.init();t.after(()=>h.shutdown());
