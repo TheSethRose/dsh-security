@@ -33,6 +33,16 @@ function mount({route,catalog=status,history=[],panelToken='test-only-panel-toke
 }
 const historyButton=p=>p.find(n=>n.type==='button'&&n.props.children[0]?.includes?.('2026-10-06'));
 const workspaceSelect=p=>p.find(n=>n.type==='select');
+const privateCheckbox=p=>p.find(n=>n.type==='input'&&n.props['aria-label']==='Capture private provider error');
+test('private capture defaults off, never authorizes inference, and is consumed per scan',async()=>{
+ const p=mount();await p.flush();assert.equal(privateCheckbox(p).props.checked,false);p.change(privateCheckbox(p),true);assert.equal(p.button('Start scan').props.disabled,true);assert.ok(!p.requests.some(r=>r.args.operation==='start'));p.change(p.input('checkbox'),true);p.click(p.button('Start scan'));assert.equal(privateCheckbox(p).props.checked,false);await p.flush();const request=p.requests.find(r=>r.args.operation==='start');assert.equal(request.args.capturePrivateError,true);assert.equal(request.options.headers['X-DSH-Security-CSRF'],'test-only-panel-token');p.unmount();
+});
+test('workspace and model changes clear private capture authorization',async()=>{
+ const p=mount();await p.flush();p.change(privateCheckbox(p),true);p.change(workspaceSelect(p),'workspace-b');assert.equal(privateCheckbox(p).props.checked,false);await p.flush();p.change(privateCheckbox(p),true);const model=p.find(n=>n.type==='select'&&n.props.value===selectionValue('deepseek','deepseek-v4-pro'));p.change(model,selectionValue('other','custom-model'));assert.equal(privateCheckbox(p).props.checked,false);p.unmount();
+});
+test('private capture path is visible but raw errors never enter diagnostics downloads',async()=>{
+ const row={...completed,status:'failed',state:'/private/security-scans/scan-a',privateErrorCapture:'saved',diagnostics:[{kind:'gateway',outcome:'failed',code:'INVALID_REQUEST'}]},p=mount({history:[row],route:a=>a.operation==='get'?row:undefined});await p.flush();p.click(historyButton(p));await p.flush();assert.match(p.text(),/Exact provider error saved locally/);assert.match(p.text(),/\/private\/security-scans\/scan-a\.provider-error\.json/);p.click(p.button('Download diagnostics'));const download=JSON.parse(await p.blobs[0].text());assert.equal(download.privateErrorCapture,undefined);assert.ok(!JSON.stringify(download).includes('provider-error.json'));assert.ok(!p.requests.some(r=>r.args.operation==='private_error'));p.unmount();
+});
 test('registered workspace fetch is authenticated local API; consent defaults unchecked; existing configured adapter is recognized',async()=>{
  const p=mount();await p.flush();assert.deepEqual(p.requests[0].args,{operation:'workspaces'});assert.equal(p.requests[0].url,'/dsh-security/api');assert.equal(p.requests[0].options.method,'POST');assert.equal(p.requests[0].options.mode,'same-origin');assert.equal(p.requests[0].options.credentials,'same-origin');assert.equal(p.requests[0].options.headers['X-DSH-Security'],'1');assert.equal(p.input('checkbox').props.checked,false);assert.equal(p.button('Start scan').props.disabled,true);assert.doesNotMatch(p.text(),/DEEPSEEK_API_KEY|api\.deepseek\.com|DeepSeek-only/);assert.match(p.text(),/Harness provider/);assert.ok(p.requests.some(r=>r.args.operation==='status'&&r.args.workspaceId==='workspace-a'));assert.ok(!p.requests.some(r=>r.args.operation==='start'));p.unmount();
 });
@@ -134,6 +144,10 @@ test('selected running poll cannot restore a failed detail deleted before effect
  const old=deferred();let gets=0,removed=false;const running={...failedScan,status:'running'};
  const p=mount({route:a=>a.operation==='list'?(removed?(old.resolve(failedScan),[]):[failedScan]):a.operation==='get'?(++gets===1?running:old.promise):a.operation==='clear_failed'?(removed=true,{removed:a.ids}):undefined});await p.flush();p.click(historyButton(p));await p.flush();p.tick();await p.flush();
  p.click(p.button('Clear failed scans (1)'));p.click(p.button('Remove failed scans'));await p.flush();assert.equal(p.button('Download diagnostics'),undefined);assert.equal(p.button('Cancel scan'),undefined);assert.match(p.text(),/No scans for this workspace/);p.unmount();
+});
+
+test('adapter rejection evidence is visible without opening raw diagnostic details',async()=>{
+ const row={...failedScan,diagnostics:[{kind:'gateway',outcome:'failed',diagnosticVersion:2,reportedHttpStatus:400,providerErrorCode:'invalid_function_parameters',providerErrorType:'invalid_request_error',rejectedParameter:'tools',rejectedToolIndex:12,rejectionHints:['tool_schema_invalid','schema_additional_properties','schema_required'],messageAvailable:true,providerMessageTruncated:true}]};const p=mount({history:[row],route:a=>a.operation==='get'?row:undefined});await p.flush();p.click(historyButton(p));await p.flush();assert.match(p.text(),/Adapter failure details/);assert.match(p.text(),/400 \(message evidence, not structured transport metadata\)/);assert.match(p.text(),/Rejected parameter: tools · tool index 12/);assert.match(p.text(),/additionalProperties schema requirement/);assert.match(p.text(),/required-fields schema mismatch/);assert.match(p.text(),/not proof/);assert.match(p.text(),/limited to 32,768 characters/);assert.equal(p.requests.some(r=>['start','validate'].includes(r.args.operation)),false);p.unmount();
 });
 
 test('diagnostic downloads include only sanitized log data, not report/error/progress or authorization',async()=>{

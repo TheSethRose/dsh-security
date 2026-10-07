@@ -17,6 +17,10 @@ function fake(options={}){
 }
 function args(f,extra={}){return {subprocess:f.subprocess,docker:'/docker',image,repo:'/repo',state:'/state',job:{id:randomUUID(),model},signal:new AbortController().signal,gateway:async()=>new Response(''),...extra};}
 const request=(id=1,extra={})=>({type:'request',id,method:'POST',path:'/responses',body:JSON.stringify({model,input:'fixture'}),...extra});
+test('native ownership failures produce a fixed engine hint without retaining state paths or stderr',async()=>{
+ const entries=[],secret='PRIVATE-STATE-PATH-CANARY',f=fake({script:({finish})=>finish(1),stderr:'Scan output directory must be owned by the current user: /state/'+secret});await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d)})));assert.equal(entries.length,1);assert.equal(entries[0].diagnosticVersion,2);assert.equal(entries[0].engineFailureHint,'state_directory_ownership');assert.equal(entries[0].requestCount,0);assert.ok(!JSON.stringify(entries).includes(secret));
+});
+
 test('container creation has a managed 30-second client deadline',async()=>{
  let bounded=false;const f=fake({command:(a,spec)=>{if(a[0]==='create'){bounded=spec.signal instanceof AbortSignal;assert.equal(spec.signal.aborted,false);}},script:({emit,finish})=>{emit({type:'result',value:'ok'});finish();}});
  assert.equal(await runEngine(args(f)),'ok');assert.equal(bounded,true);

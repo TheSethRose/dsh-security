@@ -1,5 +1,5 @@
 import {createServer} from 'node:http';
-import test from 'node:test';import assert from 'node:assert/strict';import {Readable,Writable,PassThrough} from 'node:stream';import {mkdtemp} from 'node:fs/promises';import os from 'node:os';import path from 'node:path';import {randomUUID} from 'node:crypto';import {apply,inject} from '../host.mjs';
+import test from 'node:test';import assert from 'node:assert/strict';import {Readable,Writable,PassThrough} from 'node:stream';import {mkdtemp,readFile,lstat} from 'node:fs/promises';import os from 'node:os';import path from 'node:path';import {randomUUID} from 'node:crypto';import {apply,inject} from '../host.mjs';
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};const turn=()=>new Promise(resolve=>setImmediate(resolve));
 async function harness(options={}){
  const repo=await mkdtemp(path.join(os.tmpdir(),'security-host-')),state=await mkdtemp(path.join(os.tmpdir(),'security-host-state-'));
@@ -14,7 +14,7 @@ async function harness(options={}){
    const args=spawnSpec.argv.slice(1);calls.push(args);
    if(args[0]==='start'){
     const end=deferred(),stdout=new PassThrough(),name=args.at(-1);engines.set(name,end);
-    const stdin=new Writable({write(data,_encoding,callback){const frame=JSON.parse(String(data).trim());if(frame.type==='start'){jobs.push(frame.job);started.resolve(frame.job);setImmediate(()=>{if(options.request){stdout.write(JSON.stringify({type:'request',id:1,method:'POST',path:'/responses',body:JSON.stringify({model:frame.job.model,input:'fixture'})})+'\n');}else if(options.autoComplete!==false){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[{title:'Fixture finding'}]},export:'fixture-export'}})+'\n');end.resolve({exitCode:0});}});}else if(frame.type==='end'&&options.request){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[]}}})+'\n');end.resolve({exitCode:0});}callback();}});
+    const stdin=new Writable({write(data,_encoding,callback){const frame=JSON.parse(String(data).trim());if(frame.type==='start'){jobs.push(frame.job);started.resolve(frame.job);setImmediate(()=>{if(options.request){for(let id=1;id<=(options.requestCount??1);id++)stdout.write(JSON.stringify({type:'request',id,method:'POST',path:'/responses',body:JSON.stringify({model:frame.job.model,input:'fixture'})})+'\n');}else if(options.autoComplete!==false){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[{title:'Fixture finding'}]},export:'fixture-export'}})+'\n');end.resolve({exitCode:0});}});}else if(frame.type==='end'&&options.request){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[]}}})+'\n');end.resolve({exitCode:0});}callback();}});
     return {stdin,stdout,done:end.promise,collected:{stderr:{readFrom:()=>({text:''})}},terminate:()=>end.resolve({exitCode:143}),waitForExit:async()=>{await end.promise;return true;}};
    }
    if(args[0]==='stop')for(const end of engines.values())end.resolve({exitCode:143});
@@ -31,6 +31,42 @@ async function harness(options={}){
 }
 const startArgs={provider:'deepseek',model:'deepseek-v4-pro',operation:'start',workspaceId:'workspace-a',userRequested:true,minutes:1};
 function completed(id,workspaceId,state){return {id,workspaceId,state,operation:'scan',model:'deepseek-v4-pro',mode:'standard',minutes:1,status:'completed',createdAt:new Date().toISOString(),events:[],result:{findings:{findings:[{title:'Fixture'}]}}};}
+test('Host binds native session routing to each scan ID, not caller or container metadata',async t=>{
+ const identities=[];
+ for(let scan=0;scan<2;scan++){
+  const calls=[],h=await(await harness({request:true,requestCount:2,stream(options){calls.push(options.sessionId);}})).init();t.after(()=>h.shutdown());
+  assert.equal((await h.http({...startArgs,sessionId:'caller-spoof'})).status,400);assert.equal(h.calls.length,0);
+  const started=await h.http(startArgs);await h.started;await turn();await turn();await h.shutdown();assert.equal(calls.length,2);assert.deepEqual(calls,[started.result.id,started.result.id]);identities.push(started.result.id);
+ }
+ assert.notEqual(identities[0],identities[1]);
+});
+test('private capture requires panel CSRF, source consent and explicit per-scan opt-in',async t=>{
+ const canary='TEST-ONLY-PRIVATE-PROVIDER-ERROR-CANARY',message='400: '+JSON.stringify({error:{message:'Unfamiliar rejection '+canary}});
+ for(const enabled of [false,true]){
+  const h=await(await harness({request:true,prepared(){throw Error(message);}})).init();t.after(()=>h.shutdown());
+  const args={...startArgs,capturePrivateError:enabled};assert.equal((await h.http(args,{'x-dsh-security-csrf':undefined})).status,403);assert.equal((await h.http({...args,userRequested:false})).status,400);assert.equal(h.calls.length,0);
+  await assert.rejects(h.invoke({...args,operation:'start'}));assert.equal(h.calls.length,0);
+  const started=await h.http(args);assert.equal(started.status,200);await h.started;await turn();await turn();await h.shutdown();
+  const row=h.maps.scans.get(started.result.id),target=path.join(path.dirname(row.state),row.id+'.provider-error.json');
+  assert.ok(!JSON.stringify([...h.maps.scans.values(),h.logs,h.jobs]).includes(canary));assert.ok(!h.calls.some(args=>args.includes(target)));assert.ok(!target.startsWith(h.repo+path.sep));assert.ok(!target.startsWith(row.state+path.sep));
+  if(enabled){assert.equal(row.privateErrorCapture,'saved');assert.equal((await lstat(target)).mode&0o777,0o600);const capture=JSON.parse(await readFile(target,'utf8'));assert.equal(capture.scanId,row.id);assert.equal(capture.message.text,message);assert.equal(capture.requestId,row.diagnostics.find(d=>d.kind==='gateway').requestId);}
+  else{assert.equal(row.privateErrorCapture,undefined);await assert.rejects(readFile(target),{code:'ENOENT'});}
+ }
+});
+test('concurrent provider failures retain only the first private error file',async t=>{
+ let prepares=0;const h=await(await harness({request:true,requestCount:2,prepared(){throw Error('400: unfamiliar failure #'+(++prepares));}})).init();t.after(()=>h.shutdown());const started=await h.http({...startArgs,capturePrivateError:true});await h.started;await turn();await turn();await h.shutdown();const row=h.maps.scans.get(started.result.id);assert.equal(prepares,2);assert.equal(row.privateErrorCapture,'saved');const capture=JSON.parse(await readFile(path.join(path.dirname(row.state),row.id+'.provider-error.json'),'utf8'));assert.equal(capture.message.text,'400: unfamiliar failure #1');
+});
+test('adapter with no own message records capture unavailable without invoking getters',async t=>{
+ let reads=0;const error=Object.defineProperty({code:'INVALID_REQUEST'},'message',{get(){reads++;throw Error('TEST-ONLY-GETTER-CANARY');}}),h=await(await harness({request:true,prepared(){throw error;}})).init();t.after(()=>h.shutdown());const started=await h.http({...startArgs,capturePrivateError:true});await h.started;await turn();await turn();await h.shutdown();const row=h.maps.scans.get(started.result.id);assert.equal(reads,0);assert.equal(row.privateErrorCapture,'unavailable');await assert.rejects(readFile(path.join(path.dirname(row.state),row.id+'.provider-error.json')),{code:'ENOENT'});
+});
+test('successful opt-in scan creates no private error file',async t=>{
+ const h=await(await harness({request:true})).init();t.after(()=>h.shutdown());const started=await h.http({...startArgs,capturePrivateError:true});await h.started;await turn();await turn();await h.shutdown();const row=h.maps.scans.get(started.result.id);assert.equal(row.privateErrorCapture,'empty');await assert.rejects(readFile(path.join(path.dirname(row.state),row.id+'.provider-error.json')),{code:'ENOENT'});
+});
+test('durable diagnostic schema admits only bounded rejection evidence, not arbitrary provider details',async t=>{
+ const h=await(await harness()).init();t.after(()=>h.shutdown());const entry={kind:'gateway',at:new Date().toISOString(),stage:'iterate',outcome:'failed',code:'INVALID_REQUEST',reason:'ambiguous_request_rejection',elapsedMs:10,diagnosticVersion:2,reportedHttpStatus:400,messageAvailable:true,providerMessageChars:400,providerMessageTruncated:false,providerErrorCode:'invalid_function_parameters',providerErrorType:'invalid_request_error',rejectedParameter:'tools',rejectedToolIndex:12,rejectionHints:['tool_schema_invalid','schema_required']},schema=h.spec.tables.scans.valueSchema,row={...completed(randomUUID(),'workspace-a',h.state),status:'failed',diagnostics:[entry]};assert.deepEqual(schema.parse(row).diagnostics,[entry]);
+ for(const extra of [{providerErrorCode:'PRIVATE-CANARY'},{providerErrorType:'PRIVATE-CANARY'},{rejectedParameter:'PRIVATE-CANARY'},{rejectionHints:['PRIVATE-CANARY']},{reportedHttpStatus:600},{rejectedToolIndex:1000000},{rawMessage:'PRIVATE-CANARY'},{rejectionHints:Array(20).fill('unclassified')}])assert.throws(()=>schema.parse({...row,diagnostics:[{...entry,...extra}]}));
+});
+
 test('real defineTool/domain declarations enforce agent denial and content-block array output',async t=>{
  const h=await (await harness()).init();t.after(()=>h.shutdown());assert.equal(h.spec.name,'security_scans');assert.ok(h.spec.tables.scans.valueSchema);assert.ok(h.spec.tables.leases.valueSchema);
  await assert.rejects(h.invoke({operation:'start',userRequested:true}),/must be one of \["status","list","get","cancel","export"\]/);await assert.rejects(h.invoke({operation:'validate',userRequested:true,id:randomUUID()}),/must be one of \["status","list","get","cancel","export"\]/);assert.equal(h.calls.length,0);

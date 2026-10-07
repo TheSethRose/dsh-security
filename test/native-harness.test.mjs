@@ -46,12 +46,13 @@ test('real native scanner consumes Harness SSE, executes only a container tool a
       throw Error('Offline adapter intentionally stops after tool roundtrip');
     }};
   }}});
+  let engineFailure;
   await assert.rejects(runEngine({subprocess,docker:process.env.DSH_SECURITY_DOCKER??'/usr/local/bin/docker',image,repo,state,job:{id:randomUUID(),operation:'scan',mode:'standard',model:selection.model,minutes:1},signal:AbortSignal.timeout(60000),gateway:async(body,signal)=>{
     requests.push({model:body.model,reasoning:body.reasoning,types:body.input?.map?.(i=>i.type??i.role)});
     const response=await gateway(body,signal);
     responses.push({status:response.status,...(response.status>=400?{error:await response.clone().text()}:{})});
     return response;
-  }}));
-  assert.ok(prepares.length>=2,'Native scanner must reach the prepared adapter twice: '+JSON.stringify({requests,responses}));
+  }}),error=>{engineFailure=error;return true;});
+  assert.ok(prepares.length>=2,'Native scanner must reach the prepared adapter twice: '+JSON.stringify({requests,responses,failure:engineFailure?.message}));
   assert.ok(toolChosen);assert.ok(toolOutput,'Offline container-tool roundtrip must complete: '+JSON.stringify({requests,responses}));
 });
