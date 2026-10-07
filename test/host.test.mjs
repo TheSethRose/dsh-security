@@ -31,6 +31,15 @@ async function harness(options={}){
 }
 const startArgs={provider:'deepseek',model:'deepseek-v4-pro',operation:'start',workspaceId:'workspace-a',userRequested:true,minutes:1};
 function completed(id,workspaceId,state){return {id,workspaceId,state,operation:'scan',model:'deepseek-v4-pro',mode:'standard',minutes:1,status:'completed',createdAt:new Date().toISOString(),events:[],result:{findings:{findings:[{title:'Fixture'}]}}};}
+test('operation deadline persists a distinct safe diagnostic without dispatching inference',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let preparations=0;
+  const h=await(await harness({autoComplete:false,prepared(){preparations++;}})).init();t.after(()=>h.shutdown());
+  const started=await h.http(startArgs);assert.equal(started.status,200);await h.started;await turn();
+  t.mock.timers.tick(60000);await h.shutdown();
+  const row=h.maps.scans.get(started.result.id);assert.equal(row.status,'cancelled');assert.equal(row.error,'Security scan deadline reached');
+  const engine=row.diagnostics.find(d=>d.kind==='engine');assert.equal(engine.outcome,'cancelled');assert.equal(engine.engineFailureHint,'operation_deadline');assert.equal(engine.requestCount,0);assert.equal(preparations,0);
+  assert.ok(h.calls.some(args=>args[0]==='rm'),'deadline performs container cleanup');
+});
 test('local protocol failure survives strict persistence and appears in the scan error without raw data',async t=>{
   let preparations=0;const secret='TEST-ONLY-LOCAL-PROTOCOL-SOURCE-CANARY';
   const h=await(await harness({request:true,requestBody:{input:secret,max_output_tokens:-1},prepared(){preparations++;}})).init();t.after(()=>h.shutdown());

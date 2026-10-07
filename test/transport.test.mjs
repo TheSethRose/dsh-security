@@ -37,6 +37,25 @@ test('queued requests are cancelled without dispatch or cancellation misclassifi
  const task=runEngine(args(f,{signal:controller.signal,onDiagnostic:d=>entries.push(d),gateway:()=>{if(++forwards===4)four.resolve();return new Promise(()=>{});}}));const rejected=assert.rejects(task,/cancel/i);
  await four.promise;controller.abort();await rejected;assert.equal(forwards,4);assert.equal(entries.at(-1).outcome,'cancelled');assert.equal(entries.at(-1).peakQueued,14);assert.equal(entries.at(-1).queuedRequests,14);assert.equal(f.calls.at(-1)[0],'rm');
 });
+test('whole-scan deadline is attributable even before container creation',async()=>{
+ const controller=new AbortController(),entries=[],f=fake();controller.abort(Error('Security scan deadline reached'));
+ await assert.rejects(runEngine(args(f,{signal:controller.signal,onDiagnostic:d=>entries.push(d)})),{message:'Security scan deadline reached'});
+ assert.equal(f.calls.length,0);assert.equal(entries.at(-1).outcome,'cancelled');assert.equal(entries.at(-1).engineFailureHint,'operation_deadline');
+});
+test('whole-scan deadline is distinct from request deadlines and drops queued work',{timeout:3000},async()=>{
+ const four=deferred(),controller=new AbortController(),entries=[];let forwards=0;
+ const f=fake({script:({emit})=>{for(let n=1;n<=6;n++)emit(request(n));}});
+ const task=runEngine(args(f,{signal:controller.signal,onDiagnostic:d=>entries.push(d),gateway:()=>{if(++forwards===4)four.resolve();return new Promise(()=>{});}}));const rejected=assert.rejects(task,{message:'Security scan deadline reached'});
+ await four.promise;controller.abort(Error('Security scan deadline reached'));await rejected;
+ assert.equal(forwards,4);assert.equal(entries.at(-1).outcome,'cancelled');assert.equal(entries.at(-1).engineFailureHint,'operation_deadline');assert.equal(entries.at(-1).peakQueued,2);assert.equal(f.calls.at(-1)[0],'rm');
+});
+test('unrecognized abort reasons remain private and cannot invoke message getters',{timeout:3000},async()=>{
+ const controller=new AbortController(),entries=[],secret='PRIVATE-ABORT-REASON-CANARY';let getters=0;
+ const f=fake();const task=runEngine(args(f,{signal:controller.signal,onDiagnostic:d=>entries.push(d)}));
+ const rejected=assert.rejects(task,error=>{assert.equal(error.message,'Scan cancelled or deadline reached');return true;});
+ await f.ready;const reason={};Object.defineProperty(reason,'message',{get(){getters++;return secret;}});controller.abort(reason);await rejected;
+ assert.equal(getters,0);assert.equal(entries.at(-1).outcome,'cancelled');assert.equal(entries.at(-1).engineFailureHint,'unclassified');assert.ok(!JSON.stringify(entries).includes(secret));assert.equal(f.calls.at(-1)[0],'rm');
+});
 test('the existing 180-second request deadline includes queue wait',{timeout:3000},async t=>{
  const deadlines=[],nativeTimeout=AbortSignal.timeout,four=deferred(),entries=[];let forwards=0;
  t.mock.method(AbortSignal,'timeout',milliseconds=>{if(milliseconds!==180000)return nativeTimeout(milliseconds);const controller=new AbortController();deadlines.push(controller);return controller.signal;});
