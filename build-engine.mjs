@@ -1,0 +1,14 @@
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {readFile,writeFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+const exec=promisify(execFile),root=fileURLToPath(new URL('.',import.meta.url));
+const docker=process.env.DSH_SECURITY_DOCKER??'docker';
+const metadata=JSON.parse(await readFile(new URL('./image.json',import.meta.url),'utf8'));
+const built=await exec(docker,['build','--pull','-t','dsh-security-engine:0.2.0',fileURLToPath(new URL('./engine',import.meta.url))],{cwd:root,maxBuffer:16*1024*1024});
+process.stdout.write(built.stdout);process.stderr.write(built.stderr);
+const {stdout}=await exec(docker,['image','inspect','dsh-security-engine:0.2.0','--format','{{.Id}}'],{cwd:root});
+const image=stdout.trim();if(!/^sha256:[a-f0-9]{64}$/.test(image))throw Error('Docker did not return an immutable image digest');
+await writeFile(new URL('./image.json',import.meta.url),JSON.stringify({...metadata,image},null,2)+'\n');
+await import('./build.mjs');
+console.log('Pinned engine image:',image);

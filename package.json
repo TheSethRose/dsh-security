@@ -1,0 +1,13 @@
+{
+  "name": "dsh-security", "version": "0.1.0", "private": true,
+  "description": "Isolated Codex Security engine using configured Harness models and provider authentication",
+  "type": "module", "main": "host.mjs",
+  "exports": {".": "./host.mjs", "./client": "./client.js"},
+  "peerDependencies": {"@deepseek-ai/dsh": "0.2.0-rc.2", "@deepseek-ai/dsh-client-ui-layout": "0.2.0-rc.2", "@deepseek-ai/dsh-client-ui-renderer": "0.2.0-rc.2"},
+  "peerDependenciesMeta": {"@deepseek-ai/dsh": {"optional": true}, "@deepseek-ai/dsh-client-ui-layout": {"optional": true}, "@deepseek-ai/dsh-client-ui-renderer": {"optional": true}},
+  "dependencies": {"@deepseek-ai/dsh-tools": "0.2.0-rc.2", "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2", "zod": "^4.4.3"},
+  "scripts": {"test": "node --test test/*.test.mjs", "test:containers": "DSH_SECURITY_CONTAINER_TESTS=1 node --test test/*.test.mjs", "build": "node build.mjs", "build:engine": "node build-engine.mjs"},
+  "license": "Apache-2.0",
+  "files": ["host.mjs", "core.mjs", "models.mjs", "models-*.mjs", "harness-gateway.mjs", "harness-gateway-*.mjs", "transport.mjs", "client.js", "image.json", "build.mjs", "build-engine.mjs", "cordis.patch.yml", "runtime-*.mjs", "core-*.mjs", "transport-*.mjs", "image-*.json", "seccomp-*.json", "engine", "README.md", "SECURITY.md", "NOTICE", "LICENSE"],
+  "dsh": {"bundle": {"patch": "cordis.patch.yml"}, "client": {"platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-renderer"]}}
+}

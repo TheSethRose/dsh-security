@@ -1,0 +1,28 @@
+dsh-security
+
+This project integrates, but does not vendor, @openai/codex-security 0.2.0
+and native Codex/SDK 0.162.0-alpha.15. Those components and their transitive
+dependencies retain their upstream licenses and notices in the built image.
+Published SDK source: https://github.com/openai/codex-security
+Published package git SHA: 4949af70fcfadff154f6e8fdf100faa5bf2f8169
+
+engine/seccomp.json is a MODIFIED version of Moby's Apache-2.0 seccomp
+profile from commit 6fe7deb1b9fb7c0397a4593480d7d22b9ee8caef:
+https://github.com/moby/profiles/blob/6fe7deb1b9fb7c0397a4593480d7d22b9ee8caef/seccomp/default.json
+Modifications: require CLONE_NEWUSER for the additional clone rule;
+allow namespace-only unshare flags; allow mount, umount2, pivot_root and
+sethostname for unprivileged nested Bubblewrap namespaces. No outer
+capabilities are added. Copyright remains with the Moby contributors.
+The Apache-2.0 license is supplied in LICENSE. See engine/seccomp.README.md.
+
+engine/models.json is an original minimal runtime catalog template with
+original security-analysis instructions. It does not reproduce third-party
+instruction templates. Codex model-catalog field compatibility was checked
+against DeepSeek's public native Codex integration documentation:
+https://api-docs.deepseek.com/quick_start/agent_integrations/codex/
+At runtime its model identity/context come from the selected Harness model;
+provider authentication remains with the configured Harness adapter.
+
+Node.js, Debian packages, and installed npm dependencies are obtained
+by the engine build and retain their original licenses. This repository
+does not contain their binaries or downloaded source trees.

@@ -1,0 +1,13 @@
+node_modules/
+sdk-reference/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.tgz
+*.log
+.dsh/
+security-scans/
+reports/
+exports/
+coverage/

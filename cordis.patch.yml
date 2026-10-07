@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-security
+      name: ./runtime-339429f00f8f0e4b.mjs
