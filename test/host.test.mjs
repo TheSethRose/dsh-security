@@ -1,3 +1,4 @@
+import {createServer} from 'node:http';
 import test from 'node:test';import assert from 'node:assert/strict';import {Readable,Writable,PassThrough} from 'node:stream';import {mkdtemp} from 'node:fs/promises';import os from 'node:os';import path from 'node:path';import {randomUUID} from 'node:crypto';import {apply,inject} from '../host.mjs';
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};const turn=()=>new Promise(resolve=>setImmediate(resolve));
 async function harness(options={}){
@@ -23,9 +24,9 @@ async function harness(options={}){
   connection:{requestRejection:()=>options.rejection??undefined},webServer:{register:value=>{handler=value.handler;return ()=>{};}},
   effect:setup=>{const disposer=setup();effects.push(disposer);return disposer;},logger:{error:(...args)=>{logs.push(args);options.log?.(...args);}}
  };
- const h={repo,state,ctx,maps,calls,jobs,logs,started:started.promise,get closed(){return closed;},get tool(){return tool;},get spec(){return spec;},async init(){await apply(ctx);return h;},async shutdown(){for(const effect of [...effects].reverse())await effect?.();},
+ const h={repo,state,ctx,maps,calls,jobs,logs,started:started.promise,get closed(){return closed;},get tool(){return tool;},get handler(){return handler;},get spec(){return spec;},async init(){await apply(ctx);h.panelToken=(await h.http({operation:'workspaces'})).panelToken;return h;},async shutdown(){for(const effect of [...effects].reverse())await effect?.();},
   async invoke(args,session='session-a'){return tool.execute(args,{signal:new AbortController().signal,agent:{id:session}});},
-  async http(args,headers={}){const req=Readable.from([JSON.stringify(args)]);req.method='POST';req.headers={host:'127.0.0.1:19387',origin:'http://127.0.0.1:19387','x-dsh-security':'1',...headers};req.socket={remoteAddress:'127.0.0.1'};let text;const res={statusCode:200,setHeader(){},end:value=>{text=value;}};await handler(req,res);return {status:res.statusCode,...JSON.parse(text)};}
+  async http(args,headers={}){const req=Readable.from([JSON.stringify(args)]);req.method='POST';req.headers={host:'127.0.0.1:19387',origin:'http://127.0.0.1:19387','x-dsh-security':'1','x-dsh-security-csrf':h.panelToken,...headers};req.socket={remoteAddress:'127.0.0.1'};let text;const res={statusCode:200,setHeader(){},end:value=>{text=value;}};await handler(req,res);return {status:res.statusCode,...JSON.parse(text)};}
  };return h;
 }
 const startArgs={provider:'deepseek',model:'deepseek-v4-pro',operation:'start',workspaceId:'workspace-a',userRequested:true,minutes:1};
@@ -38,18 +39,41 @@ test('real defineTool/domain declarations enforce agent denial and content-block
 test('HTTP consent requires authenticated, custom-header, same-origin UI and checkbox',async t=>{
  const h=await (await harness()).init();t.after(()=>h.shutdown());
  assert.equal((await h.http(startArgs,{'x-dsh-security':undefined})).status,403);assert.equal((await h.http(startArgs,{origin:'http://evil.test'})).status,403);
- assert.match((await h.http(startArgs,{origin:undefined})).error,/could not be verified as coming from Harness/);assert.match((await h.http({...startArgs,userRequested:false})).error,/Explicit user authorization/);assert.equal(h.calls.length,0);
+ assert.match((await h.http(startArgs,{origin:undefined,'x-dsh-security-csrf':undefined})).error,/authorization is missing or expired/);assert.match((await h.http({...startArgs,userRequested:false})).error,/Explicit user authorization/);assert.equal(h.calls.length,0);
  const rejection=await (await harness({rejection:401})).init();t.after(()=>rejection.shutdown());assert.equal((await rejection.http(startArgs)).status,401);
 });
-test('same-origin browser metadata authorizes Origin-less Fetch but never bypasses consent',async t=>{
+test('UI CSRF token supports missing Origin and Fetch Metadata without bypassing consent',async t=>{
  const h=await (await harness()).init();t.after(()=>h.shutdown());
- const headers={origin:undefined,'sec-fetch-site':'same-origin'};
+ const headers={origin:undefined,'sec-fetch-site':undefined};
  assert.match((await h.http({...startArgs,userRequested:false},headers)).error,/Explicit user authorization/);
- assert.equal(h.calls.length,0);
- for(const site of [undefined,'none','same-site','cross-site'])assert.match((await h.http(startArgs,{origin:undefined,'sec-fetch-site':site})).error,/could not be verified as coming from Harness/);
- for(const origin of ['null','http://evil.test'])assert.equal((await h.http(startArgs,{origin,'sec-fetch-site':'same-origin'})).status,403);
+ for(const token of [undefined,'','A'.repeat(43),['B'.repeat(43)],'é'.repeat(43)]){
+  for(const operation of ['start','validate'])assert.equal((await h.http({...startArgs,operation},{...headers,'x-dsh-security-csrf':token})).status,403);
+ }
+ for(const site of ['none','same-site','cross-site'])assert.equal((await h.http(startArgs,{...headers,'sec-fetch-site':site})).status,403);
+ for(const origin of ['','null','http://evil.test'])assert.equal((await h.http(startArgs,{origin,'sec-fetch-site':'same-origin'})).status,403);
  assert.equal(h.calls.length,0);
  const accepted=await h.http(startArgs,headers);assert.equal(accepted.status,200);assert.ok(accepted.result.id);await h.started;
+});
+test('UI token is authenticated, runtime-scoped and excluded from agent results and scan state',async t=>{
+ const h=await (await harness()).init(),other=await (await harness()).init();t.after(()=>h.shutdown());t.after(()=>other.shutdown());
+ assert.match(h.panelToken,/^[A-Za-z0-9_-]{43}$/);assert.notEqual(h.panelToken,other.panelToken);
+ const result=await h.http({operation:'status',workspaceId:'workspace-a'},{origin:undefined});assert.equal(result.result.panelAuthorizationVerified,true);assert.equal(result.panelToken,h.panelToken);
+ const stale=await h.http({operation:'status',workspaceId:'workspace-a'},{'x-dsh-security-csrf':other.panelToken});assert.equal(stale.result.panelAuthorizationVerified,false);assert.equal(stale.panelToken,h.panelToken);
+ assert.equal((await h.http(startArgs,{'x-dsh-security-csrf':other.panelToken})).status,403);assert.equal(h.calls.length,0);
+ assert.ok(!JSON.stringify(await h.invoke({operation:'status'})).includes(h.panelToken));assert.ok(!JSON.stringify([...h.maps.scans]).includes(h.panelToken));assert.ok(!JSON.stringify(h.logs).includes(h.panelToken));
+ const unauth=await (await harness({rejection:401})).init();t.after(()=>unauth.shutdown());const rejected=await unauth.http({operation:'workspaces'});assert.equal(rejected.status,401);assert.equal(rejected.panelToken,undefined);
+});
+test('real loopback HTTP verifies the UI token without Origin, Fetch Metadata or inference',async t=>{
+ const h=await (await harness()).init();t.after(()=>h.shutdown());let received;
+ const server=createServer((req,res)=>{received={origin:req.headers.origin,fetchSite:req.headers['sec-fetch-site']};void h.handler(req,res);});
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});t.after(()=>new Promise(resolve=>server.close(resolve)));
+ const url=`http://127.0.0.1:${server.address().port}/dsh-security/api`;
+ const post=(args,token)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-DSH-Security':'1',...(token?{'X-DSH-Security-CSRF':token}:{})},body:JSON.stringify(args)});
+ const bootstrap=await post({operation:'workspaces'});assert.equal(bootstrap.status,200);assert.equal(bootstrap.headers.get('cache-control'),'no-store');const {panelToken}=await bootstrap.json();
+ const preflight=await post({operation:'status',workspaceId:'workspace-a'},panelToken);assert.equal(preflight.status,200);assert.equal((await preflight.json()).result.panelAuthorizationVerified,true);
+ assert.equal(received.origin,undefined);assert.equal(received.fetchSite,undefined);
+ const denied=await post({...startArgs,userRequested:false},panelToken);assert.equal(denied.status,400);assert.match((await denied.json()).error,/Explicit user authorization/);
+ const noToken=await post(startArgs);assert.equal(noToken.status,403);assert.equal(h.calls.length,0);assert.equal(h.maps.scans.size,0);
 });
 test('ownership comes from execution session; foreign IDs and unregistered sessions are rejected',async t=>{
  const h=await harness();const id=randomUUID();h.maps.scans.set(id,completed(id,'workspace-b',h.state));await h.init();t.after(()=>h.shutdown());
