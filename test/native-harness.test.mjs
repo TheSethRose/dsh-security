@@ -10,7 +10,7 @@ import {createHarnessGateway} from '../harness-gateway.mjs';
 import {subprocess} from './adapter.mjs';
 
 const enabled=process.env.DSH_SECURITY_CONTAINER_TESTS==='1';
-for(const mixed of [false,true])test('real native scanner consumes Harness SSE and replays '+(mixed?'reasoning, text and multiple tools':'a container tool')+' (offline)',{skip:!enabled,timeout:90000},async()=>{
+for(const mixed of [false,true,'interleaved','namespaced','multiturn'])test('real native scanner consumes Harness SSE and replays '+(mixed==='interleaved'?'interleaved reasoning and text before multiple tools':mixed==='multiturn'?'five consecutive native turns ending with a namespaced MCP tool':mixed==='namespaced'?'reasoning, text, a namespaced MCP tool and container tools':mixed?'reasoning, text and multiple tools':'a container tool')+' (offline)',{skip:!enabled,timeout:90000},async()=>{
   const repo=await mkdtemp(path.join(os.tmpdir(),'security-native-bridge-'));
   const state=await mkdtemp(path.join(os.tmpdir(),'security-native-bridge-state-'));
   await writeFile(path.join(repo,'example.py'),'print("offline bridge fixture")\n');
@@ -23,23 +23,35 @@ for(const mixed of [false,true])test('real native scanner consumes Harness SSE a
   const gateway=createHarnessGateway({selection,llm:{async prepareCall(config,signal){
     assert.deepEqual(config,selection);assert.ok(signal instanceof AbortSignal);prepares.push(config);
     return {config,stream:async function*(options){
-      if(generated++===0){
+      const turn=generated++;
+      if(turn<(mixed==='multiturn'?5:1)){
         const tool=options.tools.find(t=>t.parameters?.properties?.cmd||t.parameters?.properties?.command);
         assert.ok(tool,'Native scanner must advertise a local command tool');toolChosen=true;
         const properties=tool.parameters.properties;
         const args={...(properties.cmd?{cmd:'pwd'}:{command:'pwd'}),...(properties.workdir?{workdir:'/repo'}:{})};
         for(const key of tool.parameters.required??[])assert.ok(Object.hasOwn(args,key),'Unexpected required command-tool field: '+key);
         const argumentsText=JSON.stringify(args);
+        const interleaved=mixed==='interleaved'||mixed==='multiturn'&&turn===4;
         if(mixed){
           yield {type:'block-start',index:0,blockType:'reasoning'};
           yield {type:'reasoning-delta',index:0,text:'offline planning'};
-          yield {type:'block-end',index:0,block:{type:'reasoning',text:'offline planning'}};
+          if(!interleaved)yield {type:'block-end',index:0,block:{type:'reasoning',text:'offline planning'}};
           yield {type:'block-start',index:1,blockType:'text'};
           yield {type:'text-delta',index:1,text:'offline command check'};
+          if(interleaved)yield {type:'block-end',index:0,block:{type:'reasoning',text:'offline planning'}};
           yield {type:'block-end',index:1,block:{type:'text',text:'offline command check'}};
         }
+        const namespaced=mixed==='namespaced'||mixed==='multiturn'&&turn===4;
+        if(namespaced){
+          const progress=options.tools.find(t=>t.parameters?.properties?.scanId&&t.parameters?.properties?.preflightChecks);
+          assert.ok(progress,'Native scanner must advertise its namespaced MCP progress tool');
+          const argumentsText=JSON.stringify({scanId:randomUUID(),phase:'preflight',preflightChecks:[]});
+          yield {type:'block-start',index:2,blockType:'tool-call'};
+          yield {type:'tool-call-delta',index:2,id:'offline-adapter-progress',name:progress.name,argumentsDelta:argumentsText};
+          yield {type:'block-end',index:2,block:{type:'tool-call',id:'offline-adapter-progress',name:progress.name,arguments:argumentsText}};
+        }
         for(let n=0;n<(mixed?2:1);n++){
-          const index=mixed?n+2:0,callId=n?'offline-adapter-call-2':'offline-adapter-call';
+          const index=mixed?n+(namespaced?3:2):0,callId=(n?'offline-adapter-call-2':'offline-adapter-call')+(turn?'-turn-'+turn:'');
           yield {type:'block-start',index,blockType:'tool-call'};
           yield {type:'tool-call-delta',index,id:callId,name:tool.name,argumentsDelta:argumentsText};
           yield {type:'block-end',index,block:{type:'tool-call',id:callId,name:tool.name,arguments:argumentsText}};
@@ -54,8 +66,14 @@ for(const mixed of [false,true])test('real native scanner consumes Harness SSE a
       assert.ok(output,'Native local-tool result must map back to the adapter call');
       assert.match(JSON.stringify(output.content),/\/repo/);
       if(mixed){
-        assert.deepEqual(assistant.content.map(block=>block.type),['reasoning','text','tool-call','tool-call']);
+        assert.deepEqual(assistant.content.map(block=>block.type),mixed==='namespaced'?['reasoning','text','tool-call','tool-call','tool-call']:['reasoning','text','tool-call','tool-call']);
         assert.ok(options.messages.some(m=>m.role==='tool'&&m.toolCallId==='offline-adapter-call-2'));
+        if(mixed==='namespaced'||mixed==='multiturn'){
+          assert.ok(options.messages.some(m=>m.role==='tool'&&m.toolCallId==='offline-adapter-progress'));
+          const progressAssistant=options.messages.find(m=>m.role==='assistant'&&m.content.some(b=>b.id==='offline-adapter-progress'));
+          assert.deepEqual(progressAssistant.content.map(b=>b.type),['reasoning','text','tool-call','tool-call','tool-call']);
+          assert.deepEqual(progressAssistant.source.replayState,replayState);
+        }
       }
       toolOutput=true;
       throw Error('Offline adapter intentionally stops after tool roundtrip');
@@ -63,18 +81,18 @@ for(const mixed of [false,true])test('real native scanner consumes Harness SSE a
   }}});
   let engineFailure,nativeReplay;
   await assert.rejects(runEngine({subprocess,docker:process.env.DSH_SECURITY_DOCKER??'/usr/local/bin/docker',image,repo,state,job:{id:randomUUID(),operation:'scan',mode:'standard',model:selection.model,minutes:1},signal:AbortSignal.timeout(60000),gateway:async(body,signal)=>{
-    requests.push({model:body.model,reasoning:body.reasoning,types:body.input?.map?.(i=>i.type??i.role)});
+    requests.push({model:body.model,reasoning:body.reasoning,types:body.input?.map?.(i=>i.type??i.role),outputKinds:body.input?.filter?.(i=>i.type==='function_call_output').map(i=>({kind:Array.isArray(i.output)?'array':typeof i.output,partTypes:Array.isArray(i.output)?i.output.map(p=>p.type):undefined}))});
     if(mixed&&requests.length===2)nativeReplay=body.input.filter(item=>item.type==='reasoning'||item.role==='assistant'||item.type==='function_call');
     const response=await gateway(body,signal);
     responses.push({status:response.status,...(response.status>=400?{error:await response.clone().text()}:{})});
     return response;
   }}),error=>{engineFailure=error;return true;});
   if(mixed){
-    assert.equal(nativeReplay?.length,4);
+    assert.equal(nativeReplay?.length,mixed==='namespaced'?5:4);
     assert.equal(nativeReplay[0].content,null);
     assert.equal(nativeReplay[0].encrypted_content,null);
     assert.equal(nativeReplay[1].content[0].annotations,undefined);
   }
-  assert.ok(prepares.length>=2,'Native scanner must reach the prepared adapter twice: '+JSON.stringify({requests,responses,failure:engineFailure?.message}));
+  assert.ok(prepares.length>=(mixed==='multiturn'?6:2),'Native scanner must reach every prepared adapter turn: '+JSON.stringify({requests,responses,failure:engineFailure?.message}));
   assert.ok(toolChosen);assert.ok(toolOutput,'Offline container-tool roundtrip must complete: '+JSON.stringify({requests,responses}));
 });

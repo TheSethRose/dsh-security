@@ -207,6 +207,67 @@ test('native null reasoning fields and omitted empty annotations preserve exact 
   assert.equal(f.streams.length, 2, 'Modified or incomplete history must never reach the adapter');
 });
 
+test('interleaved SSE accepts only its two exact emitted orders and restores provider block order and IDs', async () => {
+  const replayState = { opaque: 'fixture replay envelope' };
+  const tools = [{ type: 'function', name: 'command', parameters: { type: 'object', properties: {} } }];
+  const f = fixture((options, turn) => turn === 1 ? [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'original-a', name: options.tools[0].name, argumentsDelta: '{}' },
+    { type: 'block-start', index: 1, blockType: 'reasoning' },
+    { type: 'reasoning-delta', index: 1, text: 'fixture reasoning' },
+    { type: 'block-start', index: 2, blockType: 'text' },
+    { type: 'text-delta', index: 2, text: 'fixture text' },
+    { type: 'block-end', index: 1, block: { type: 'reasoning', text: 'fixture reasoning' } },
+    { type: 'block-start', index: 3, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 3, id: 'original-b', name: options.tools[0].name, argumentsDelta: '{}' },
+    { type: 'block-end', index: 3, block: { type: 'tool-call', id: 'original-b', name: options.tools[0].name, arguments: '{}' } },
+    { type: 'block-end', index: 2, block: { type: 'text', text: 'fixture text' } },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'original-a', name: options.tools[0].name, arguments: '{}' } },
+    { type: 'finish', reason: { kind: 'tool-calls' }, replayState },
+  ] : textChunks('done'));
+  const events = await parseSSE(await f.gateway(request({ tools, stream: true })));
+  const output = events.at(-1).response.output;
+  const completed = events.filter(event => event.type === 'response.output_item.done').map(event => event.item);
+  assert.notDeepEqual(output.map(item => item.id), completed.map(item => item.id));
+  const outputs = output.filter(item => item.type === 'function_call').map(item => ({ type: 'function_call_output', call_id: item.call_id, output: 'fixture result' }));
+  for (const group of [output, completed]) {
+    assert.equal((await f.gateway(request({ tools, input: [...group, ...outputs] }))).status, 200);
+    const replay = f.streams.at(-1).messages.find(message => message.role === 'assistant');
+    assert.deepEqual(replay.content.map(block => block.type), ['tool-call', 'reasoning', 'text', 'tool-call']);
+    assert.deepEqual(replay.source.replayState, replayState);
+    assert.equal(replay.content[0].id, 'original-a');
+    assert.equal(replay.content[3].id, 'original-b');
+    assert.deepEqual(f.streams.at(-1).messages.filter(message => message.role === 'tool').map(message => message.toolCallId), ['original-b', 'original-a']);
+  }
+  const validOrders = [output, completed].map(group => group.map(item => item.id).join(','));
+  function permutations(items) { return items.length ? items.flatMap((item, index) => permutations(items.filter((_, other) => other !== index)).map(rest => [item, ...rest])) : [[]]; }
+  for (const group of permutations(output)) {
+    if (validOrders.includes(group.map(item => item.id).join(','))) continue;
+    assert.equal((await f.gateway(request({ tools, input: [...group, ...outputs] }))).status, 400);
+  }
+  for (const group of [output, completed]) for (const index of group.keys()) {
+    const incomplete = group.filter((_, position) => position !== index);
+    assert.equal((await f.gateway(request({ tools, input: [...incomplete, ...outputs] }))).status, 400);
+    const modified = structuredClone(group);
+    modified[index].unknown = 'fixture tampering';
+    assert.equal((await f.gateway(request({ tools, input: [...modified, ...outputs] }))).status, 400);
+  }
+  assert.equal(f.prepares.length, 3, 'All other permutations, missing items and modified items reject before adapter preparation');
+});
+
+test('native MCP text-array outputs preserve every text part and reject non-text or unknown content', async () => {
+  const f = fixture();
+  const result = output => request({ input: [{ type: 'function_call_output', call_id: 'external-call', output }] });
+  for (const parts of [[], [{ type: 'input_text', text: 'one' }, { type: 'input_text', text: 'two' }]]) {
+    assert.equal((await f.gateway(result(parts))).status, 200);
+    assert.deepEqual(f.streams.at(-1).messages[0].content, parts.map(part => ({ type: 'text', text: part.text })));
+  }
+  for (const output of [null, {}, 3, [{ type: 'input_image', image_url: 'fixture' }], [{ type: 'input_text', text: 'one', hidden: 'fixture' }], [{ type: 'input_text', text: 3 }]]) {
+    assert.equal((await f.gateway(result(output))).status, 400);
+  }
+  assert.equal(f.prepares.length, 2);
+});
+
 test('terminal errors and thrown adapter failures are sanitized with no retry or fallback', async () => {
   for (const kind of ['error', 'aborted']) {
     const f = fixture([{ type: 'finish', reason: { kind, failure: { code: 'SECRET', message: 'credential=secret' } } }]);
