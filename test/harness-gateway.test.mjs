@@ -167,6 +167,46 @@ test('incomplete or edited cached replay is rejected instead of losing provider 
   assert.equal(f.streams.length, 1);
 });
 
+test('native null reasoning fields and omitted empty annotations preserve exact cached replay', async () => {
+  const opaque = { response: { fixture: 'provider-owned replay' } };
+  const f = fixture((options, n) => {
+    if (n > 1) return textChunks('continued');
+    const chunks = callChunks(options.tools[0].name, '{"cmd":"pwd"}', opaque);
+    return [...chunks.slice(0, 3), ...textChunks('checking').slice(0, 3).map(chunk => ({ ...chunk, index: 1 })), ...chunks.slice(3, -1).map(chunk => ({ ...chunk, index: 2 })), chunks.at(-1)];
+  });
+  const tools = [{ type: 'function', name: 'f', parameters: {} }];
+  const first = await (await f.gateway(request({ tools }))).json();
+  const normalized = structuredClone(first.output);
+  normalized[0].content = null;
+  normalized[0].encrypted_content = null;
+  delete normalized[1].content[0].annotations;
+  for (const item of normalized) delete item.status;
+  const input = [...normalized, { type: 'function_call_output', call_id: normalized[2].call_id, output: 'fixture result' }];
+  assert.equal((await f.gateway(request({ tools, input }))).status, 200);
+  const assistant = f.streams[1].messages[0];
+  assert.deepEqual(assistant.source.replayState, opaque);
+  assert.deepEqual(assistant.content.map(block => block.type), ['reasoning', 'text', 'tool-call']);
+  assert.equal(f.streams[1].messages[1].toolCallId, 'adapter-call-id');
+  for (const mutate of [
+    items => { items[0].summary[0].text = 'edited'; },
+    items => { items[0].encrypted_content = 'injected'; },
+    items => { items[0].content = []; },
+    items => { items[1].content[0].text = 'edited'; },
+    items => { items[1].content[0].annotations = [{ type: 'unexpected' }]; },
+    items => { items[1].unexpected = true; },
+    items => { items[2].arguments = '{"cmd":"edited"}'; },
+    items => { items[2].name = 'edited'; },
+    items => { items[2].call_id = 'edited'; },
+    items => { items[2].id = 'edited'; },
+    items => { items.reverse(); },
+    items => { items.pop(); },
+  ]) {
+    const edited = structuredClone(normalized); mutate(edited);
+    assert.equal((await f.gateway(request({ tools, input: edited }))).status, 400);
+  }
+  assert.equal(f.streams.length, 2, 'Modified or incomplete history must never reach the adapter');
+});
+
 test('terminal errors and thrown adapter failures are sanitized with no retry or fallback', async () => {
   for (const kind of ['error', 'aborted']) {
     const f = fixture([{ type: 'finish', reason: { kind, failure: { code: 'SECRET', message: 'credential=secret' } } }]);

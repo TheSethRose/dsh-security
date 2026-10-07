@@ -14,7 +14,7 @@ async function harness(options={}){
    const args=spawnSpec.argv.slice(1);calls.push(args);
    if(args[0]==='start'){
     const end=deferred(),stdout=new PassThrough(),name=args.at(-1);engines.set(name,end);
-    const stdin=new Writable({write(data,_encoding,callback){const frame=JSON.parse(String(data).trim());if(frame.type==='start'){jobs.push(frame.job);started.resolve(frame.job);setImmediate(()=>{if(options.request){for(let id=1;id<=(options.requestCount??1);id++)stdout.write(JSON.stringify({type:'request',id,method:'POST',path:'/responses',body:JSON.stringify({model:frame.job.model,input:'fixture'})})+'\n');}else if(options.autoComplete!==false){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[{title:'Fixture finding'}]},export:'fixture-export'}})+'\n');end.resolve({exitCode:0});}});}else if(frame.type==='end'&&options.request){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[]}}})+'\n');end.resolve({exitCode:0});}callback();}});
+    const stdin=new Writable({write(data,_encoding,callback){const frame=JSON.parse(String(data).trim());if(frame.type==='start'){jobs.push(frame.job);started.resolve(frame.job);setImmediate(()=>{if(options.request){for(let id=1;id<=(options.requestCount??1);id++)stdout.write(JSON.stringify({type:'request',id,method:'POST',path:'/responses',body:JSON.stringify({model:frame.job.model,input:'fixture',...options.requestBody})})+'\n');}else if(options.autoComplete!==false){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[{title:'Fixture finding'}]},export:'fixture-export'}})+'\n');end.resolve({exitCode:0});}});}else if(frame.type==='end'&&options.request){stdout.write(JSON.stringify({type:'result',value:{findings:{findings:[]}}})+'\n');end.resolve({exitCode:0});}callback();}});
     return {stdin,stdout,done:end.promise,collected:{stderr:{readFrom:()=>({text:''})}},terminate:()=>end.resolve({exitCode:143}),waitForExit:async()=>{await end.promise;return true;}};
    }
    if(args[0]==='stop')for(const end of engines.values())end.resolve({exitCode:143});
@@ -31,6 +31,17 @@ async function harness(options={}){
 }
 const startArgs={provider:'deepseek',model:'deepseek-v4-pro',operation:'start',workspaceId:'workspace-a',userRequested:true,minutes:1};
 function completed(id,workspaceId,state){return {id,workspaceId,state,operation:'scan',model:'deepseek-v4-pro',mode:'standard',minutes:1,status:'completed',createdAt:new Date().toISOString(),events:[],result:{findings:{findings:[{title:'Fixture'}]}}};}
+test('local protocol failure survives strict persistence and appears in the scan error without raw data',async t=>{
+  let preparations=0;const secret='TEST-ONLY-LOCAL-PROTOCOL-SOURCE-CANARY';
+  const h=await(await harness({request:true,requestBody:{input:secret,max_output_tokens:-1},prepared(){preparations++;}})).init();t.after(()=>h.shutdown());
+  const started=await h.http({...startArgs,capturePrivateError:true});await h.started;await turn();await turn();await h.shutdown();
+  const row=h.maps.scans.get(started.result.id);assert.equal(row.status,'failed');assert.equal(preparations,0);assert.equal(row.privateErrorCapture,'empty');
+  assert.equal(row.error,'Harness protocol translation failed (invalid_token_limit, stage translate); no fallback attempted');
+  assert.equal(row.diagnostics.find(d=>d.kind==='gateway').protocolInvariant,'invalid_token_limit');assert.ok(!JSON.stringify(row).includes(secret));assert.ok(!JSON.stringify(h.logs).includes(secret));
+  const reply=await h.http({operation:'get',workspaceId:'workspace-a',id:row.id});assert.equal(reply.result.diagnostics[0].protocolInvariant,'invalid_token_limit');
+  const dump=await h.http({operation:'export',workspaceId:'workspace-a',id:row.id,format:'json'});assert.ok(!JSON.stringify(dump).includes(secret));
+});
+
 test('Host binds native session routing to each scan ID, not caller or container metadata',async t=>{
  const identities=[];
  for(let scan=0;scan<2;scan++){

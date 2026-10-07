@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createHarnessGateway} from '../harness-gateway.mjs';
+import {createHarnessGateway,PROTOCOL_INVARIANTS} from '../harness-gateway.mjs';
+import {readFile} from 'node:fs/promises';
 import {retainDiagnostic,DIAGNOSTIC_LIMIT} from '../core.mjs';
 test('retention caps actual entries at 128 and accounts for dropped entries without numeric overflow',()=>{
  const job={};for(let n=0;n<DIAGNOSTIC_LIMIT+3;n++)assert.equal(retainDiagnostic(job,{sequence:n}),n<DIAGNOSTIC_LIMIT);
@@ -46,7 +47,25 @@ test('trusted upstream status distinguishes size rejection, code alone remains a
 test('prepare, dispatch and translation failures identify stage without raw errors',async()=>{
  const error=Object.assign(Error(secret),{code:'AUTH'});
  for(const [opts,stage]of [[{prepareError:error},'prepare'],[{thrown:error},'dispatch']]){const f=setup(opts);await(await f.gateway(request)).text();assert.equal(f.diagnostics.length,1);assert.equal(f.diagnostics[0].stage,stage);assert.equal(f.diagnostics[0].code,'AUTH');assert.ok(!JSON.stringify(f.diagnostics).includes(secret));}
- const f=setup();assert.equal((await f.gateway({...request,max_output_tokens:-1})).status,400);assert.equal(f.diagnostics[0].stage,'translate');assert.equal(f.diagnostics[0].code,'PROTOCOL_ERROR');assert.equal(f.dispatches,0);
+ const f=setup();assert.equal((await f.gateway({...request,max_output_tokens:-1})).status,400);assert.equal(f.diagnostics[0].stage,'translate');assert.equal(f.diagnostics[0].code,'PROTOCOL_ERROR');assert.equal(f.diagnostics[0].protocolInvariant,'invalid_token_limit');assert.ok(!JSON.stringify(f.diagnostics).includes(secret));assert.equal(f.dispatches,0);
+});
+
+test('every literal local rejection has a fixed invariant, with no provider-controlled invariant',async()=>{
+  const source=await readFile(new URL('../harness-gateway.mjs',import.meta.url),'utf8');
+  const map=source.slice(source.indexOf('const PROTOCOL_MESSAGES'),source.indexOf('export const PROTOCOL_INVARIANTS'));
+  const mapped=[...map.matchAll(/^  ([a-z_]+): '([^']+)',/gm)];
+  assert.deepEqual(PROTOCOL_INVARIANTS,[...mapped.map(match=>match[1]),'unclassified']);
+  for(const [,message]of source.matchAll(/(?:fail|new ProtocolError)\('([^']+)'\)/g))assert.ok(mapped.some(match=>match[2]===message),'Missing invariant: '+message);
+  const f=setup({failure:{code:'INVALID_REQUEST',protocolInvariant:secret,message:secret}});await(await f.gateway(request)).text();
+  assert.equal(f.diagnostics[0].protocolInvariant,undefined);assert.ok(!JSON.stringify(f.diagnostics).includes(secret));
+});
+
+test('cached replay rejection records its exact fixed invariant without retaining assistant text',async()=>{
+  const f=setup();const frames=(await(await f.gateway(request)).text()).trim().split('\n\n').map(frame=>JSON.parse(frame.split('\n').find(line=>line.startsWith('data: ')).slice(6)));
+  const output=frames.find(frame=>frame.type==='response.completed').response.output;
+  output[0].content[0].text+='edited';
+  assert.equal((await f.gateway({...request,input:output})).status,400);
+  assert.equal(f.diagnostics[1].protocolInvariant,'replay_group_mismatch');assert.equal(f.diagnostics[1].stage,'translate');assert.equal(f.dispatches,1);assert.ok(!JSON.stringify(f.diagnostics).includes(secret));
 });
 
 test('unknown failure codes and diagnostic getters are not exposed or evaluated',async()=>{
