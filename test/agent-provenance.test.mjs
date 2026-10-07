@@ -4,7 +4,7 @@ import {createHarnessGateway} from '../harness-gateway.mjs';
 const selection={provider:'offline-provider',model:'offline-model'};
 const task='private owned task',answer='private owned answer';
 const parameters={type:'object',properties:{task_name:{type:'string'},message:{type:'string'},fork_turns:{type:'string'}}};
-const catalog=(name='spawn_agent',namespace='collaboration')=>[{type:'namespace',name:namespace,tools:[{type:'function',name,parameters}]}];
+const catalog=(name='spawn_agent',namespace='collaboration')=>[{type:'namespace',name:namespace,tools:[{type:'function',name,parameters:name==='spawn_agent'?parameters:{type:'object',properties:{target:{type:'string'},message:{type:'string'}},required:['target','message']}}]}];
 const request=extra=>({model:selection.model,input:'offline root task',...extra});
 const prefix=(kind,author,recipient)=>`Message Type: ${kind}\nTask name: ${recipient}\nSender: ${author}\nPayload:\n`;
 const agent=(kind='NEW_TASK',author='/root',recipient='/root/worker',payload=task,mode='encrypted')=>({type:'agent_message',id:'amsg_offline',author,recipient,content:mode==='merged'?[{type:'input_text',text:prefix(kind,author,recipient)+payload}]:[{type:'input_text',text:prefix(kind,author,recipient)},{type:mode==='encrypted'?'encrypted_content':'input_text',...(mode==='encrypted'?{encrypted_content:payload}:{text:payload})}]});
@@ -46,11 +46,15 @@ test('nested delegation, absolute follow-up and sibling message routes require t
  assert.equal((await f.gateway(request({input:[agent('NEW_TASK','/root/worker','/root/worker/child',task+' nested')]}))).status,200);
  await reject(f,[agent('NEW_TASK','/root/worker','/root/child',task+' nested')]);
  for(const [name,kind]of[['followup_task','NEW_TASK'],['send_message','MESSAGE']]){
-  const g=fixture((options,n)=>n===1?toolChunks(options,{task_name:'/root/worker',message:task}):textChunks(answer));
+  const g=fixture((options,n)=>n===1?toolChunks(options,{target:'/root/worker',message:task}):textChunks(answer));
   await g.gateway(request({tools:catalog(name)}));
   assert.equal((await g.gateway(request({input:[agent(kind)]}))).status,200);
   assert.equal(g.prepares.length,2);
   await reject(g,[agent(kind==='MESSAGE'?'NEW_TASK':'MESSAGE')]);
+   const legacy=fixture((options,n)=>n===1?toolChunks(options,{task_name:'/root/worker',message:task}):textChunks(answer));
+   await legacy.gateway(request({tools:catalog(name)}));
+   await reject(legacy,[agent(kind)]);
+   assert.equal(legacy.prepares.length,1);
  }
 });
 test('arbitrary plaintext routing cannot mint an actor or authorize a later worker return',async()=>{
@@ -122,6 +126,15 @@ test('custom or ordinary same-name tools cannot establish collaboration provenan
  await f.gateway(request({tools:[{type:'function',name:'spawn_agent',parameters}]}));await reject(f,[agent()]);
  const g=fixture(options=>toolChunks(options,{input:task}));
  await g.gateway(request({tools:[{type:'namespace',name:'collaboration',tools:[{type:'custom',name:'spawn_agent'}]}]}));await reject(g,[agent()]);
+});
+test('byte-budget eviction expires task and final-answer provenance well before the entry-count ceiling',async()=>{
+ const heavy=catalog();heavy[0].tools[0].description='offline padding '.padEnd(8*1024*1024,'x');
+ const f=fixture();assert.equal((await f.gateway(request({tools:heavy}))).status,200);
+ assert.equal((await f.gateway(request({tools:heavy,input:[agent()]}))).status,200);
+ assert.equal((await f.gateway(request({tools:heavy,input:[agent('FINAL_ANSWER','/root/worker','/root',answer)]}))).status,200);
+ for(let i=0;i<7;i++)assert.equal((await f.gateway(request({tools:heavy}))).status,200);
+ assert.equal(f.prepares.length,10);
+ await reject(f,[agent()]);await reject(f,[agent('FINAL_ANSWER','/root/worker','/root',answer)]);
 });
 test('owned delegation provenance expires with the existing bounded replay cache',async()=>{
  const f=fixture();await f.gateway(request({tools:catalog()}));

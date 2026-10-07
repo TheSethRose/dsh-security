@@ -68,6 +68,39 @@ test('cached replay rejection records its exact fixed invariant without retainin
   assert.equal(f.diagnostics[1].protocolInvariant,'replay_group_mismatch');assert.equal(f.diagnostics[1].stage,'translate');assert.equal(f.dispatches,1);assert.ok(!JSON.stringify(f.diagnostics).includes(secret));
 });
 
+test('replay mismatches identify bounded structural differences without exposing owned content or identities',async()=>{
+ const diagnostics=[];let prepares=0;
+ const gateway=createHarnessGateway({selection,onDiagnostic:d=>diagnostics.push(d),llm:{async prepareCall(config){prepares++;return {config,stream:async function*(){
+  yield {type:'block-start',index:0,blockType:'reasoning'};yield {type:'reasoning-delta',index:0,text:secret};yield {type:'block-end',index:0,block:{type:'reasoning',text:secret}};
+  yield {type:'block-start',index:1,blockType:'text'};yield {type:'text-delta',index:1,text:secret};yield {type:'block-end',index:1,block:{type:'text',text:secret}};
+  for(let index=2;index<4;index++){
+   const argumentsText=JSON.stringify({message:secret,flag:true});
+   yield {type:'block-start',index,blockType:'tool-call'};yield {type:'tool-call-delta',index,id:'private-adapter-'+index,name:'dsh_tool_0',argumentsDelta:argumentsText};yield {type:'block-end',index,block:{type:'tool-call',id:'private-adapter-'+index,name:'dsh_tool_0',arguments:argumentsText}};
+  }
+  yield {type:'finish',reason:{kind:'tool-calls'}};
+ }};}}});
+ const body={model:selection.model,input:secret,tools:[{type:'function',name:secret,parameters:{type:'object',properties:{message:{type:'string'},flag:{type:'boolean'}}}}]};
+ const response=await gateway(body),output=(await response.json()).output;
+ const cases=[
+  ['missing_item',3,input=>input.pop()],
+  ['owned_item_reordered',2,input=>[input[2],input[3]]=[input[3],input[2]]],
+  ['tool_output_interleaved',3,input=>input.splice(3,0,{type:'function_call_output',call_id:input[2].call_id,output:secret})],
+  ['item_type_changed',1,input=>input[1].type='reasoning'],
+  ['identity_changed',1,input=>input[1].id=secret],
+  ['tool_arguments_changed',2,input=>input[2].arguments=JSON.stringify({flag:true,message:secret},null,2),true],
+  ['tool_arguments_changed',2,input=>input[2].arguments=JSON.stringify({message:secret+' changed',flag:true}),false],
+  ['tool_route_changed',2,input=>input[2].name=secret+' changed'],
+  ['reasoning_summary_changed',0,input=>input[0].summary[0].text+=' changed'],
+  ['message_content_changed',1,input=>input[1].content[0].text+=' changed'],
+  ['item_fields_changed',0,input=>input[0].unexpected=secret]
+ ];
+ for(const [mismatch,position,mutate,equivalent]of cases){
+  const input=structuredClone(output);mutate(input);const failure=await gateway({...body,input});assert.equal(failure.status,400);
+  const d=diagnostics.at(-1);assert.equal(d.protocolInvariant,'replay_group_mismatch');assert.equal(d.replayMismatch,mismatch);assert.equal(d.replayMismatchPosition,position);assert.equal(d.replayGroupOffset,0);assert.equal(d.replayExpectedItems,4);assert.equal(d.replayAvailableItems,input.length);assert.equal(d.replayArgumentsEquivalent,equivalent);assert.equal(prepares,1);
+  const evidence=JSON.stringify({diagnostics,body:await failure.json()});for(const value of [secret,...output.flatMap(i=>[i.id,i.call_id]).filter(Boolean)])assert.ok(!evidence.includes(value));
+ }
+});
+
 test('unknown failure codes and diagnostic getters are not exposed or evaluated',async()=>{
  let reads=0;for(const field of ['code','status','failure']){const error=Object.defineProperty(Error(secret),field,{get(){reads++;throw Error(secret);}});const f=setup({thrown:error});await(await f.gateway(request)).text();assert.equal(f.diagnostics[0].code,'UNKNOWN');assert.ok(!JSON.stringify(f.diagnostics).includes(secret));}assert.equal(reads,0);
  const f=setup({failure:{code:secret,message:secret}});await(await f.gateway(request)).text();assert.equal(f.diagnostics[0].code,'UNKNOWN');assert.ok(!JSON.stringify(f.diagnostics).includes(secret));
