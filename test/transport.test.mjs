@@ -21,6 +21,9 @@ test('native ownership failures produce a fixed engine hint without retaining st
  const entries=[],secret='PRIVATE-STATE-PATH-CANARY',f=fake({script:({finish})=>finish(1),stderr:'Scan output directory must be owned by the current user: /state/'+secret});await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d)})));assert.equal(entries.length,1);assert.equal(entries[0].diagnosticVersion,2);assert.equal(entries[0].engineFailureHint,'state_directory_ownership');assert.equal(entries[0].requestCount,0);assert.ok(!JSON.stringify(entries).includes(secret));
 });
 
+test('unsafe runtime ownership fails before Docker or inference with a fixed private diagnosis',async()=>{
+ const f=fake(),entries=[];let calls=0;await assert.rejects(runEngine(args(f,{state:'/',job:{id:randomUUID(),model,operation:'scan'},gateway:async()=>{calls++;return new Response('');},onDiagnostic:entry=>entries.push(entry)})),/must be private and owned/);assert.equal(f.calls.length,0);assert.equal(calls,0);assert.equal(entries.length,1);assert.equal(entries[0].engineFailureHint,'state_directory_ownership');assert.equal(entries[0].dispatchedRequests,0);
+});
 test('queued native requests remain FIFO even when a new frame arrives during slot release',{timeout:3000},async()=>{
  const gates=Array.from({length:7},deferred),entered=Array.from({length:7},deferred),order=[],entries=[];let ended=0;
  const numbered=n=>request(n,{body:JSON.stringify({model,input:String(n)})});
@@ -126,7 +129,18 @@ test('fifth simultaneous request waits without exceeding four active forwards',{
 });
 test('101st sequential request exceeds the total request ceiling',{timeout:3000},async()=>{
  let count=0;const entries=[],f=fake({script:({emit})=>emit(request(1)),input:({frame,emit})=>{if(frame.type==='end')emit(request(++count+1));}});let forwards=0;
- await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:async()=>{forwards++;return new Response('');}})),/limit exceeded/);assert.equal(forwards,100);assert.equal(entries.at(-1).engineFailureHint,'request_limit');
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:async()=>{forwards++;return new Response('');}})),/Security scan model-request ceiling reached/);assert.equal(forwards,100);assert.equal(entries.at(-1).engineFailureHint,'request_limit');assert.equal(entries.at(-1).requestLimit,100);assert.equal(entries.at(-1).requestCount,101);assert.equal(entries.at(-1).dispatchedRequests,100);
+});
+test('configured 500-request ceiling admits 500 and rejects 501 before dispatch',{timeout:3000},async()=>{
+ let count=0,forwards=0;const entries=[],f=fake({script:({emit})=>emit(request(1)),input:({frame,emit})=>{if(frame.type==='end')emit(request(++count+1));}});
+ await assert.rejects(runEngine(args(f,{job:{id:randomUUID(),model,requestLimit:500},onDiagnostic:d=>entries.push(d),gateway:async()=>{forwards++;return new Response('');}})),{message:'Security scan model-request ceiling reached'});
+ const terminal=entries.at(-1);assert.equal(forwards,500);assert.equal(terminal.requestLimit,500);assert.equal(terminal.requestCount,501);assert.equal(terminal.admittedRequests,500);assert.equal(terminal.dispatchedRequests,500);assert.equal(terminal.engineFailureHint,'request_limit');assert.equal(f.calls.at(-1)[0],'rm');
+});
+test('configured request ceilings are integer bounded and fail before Docker or inference',async()=>{
+ for(const requestLimit of [0,-1,501,1.5,'500',null,NaN,Infinity]){const f=fake();let forwards=0;await assert.rejects(runEngine(args(f,{job:{id:randomUUID(),model,requestLimit},gateway:()=>{forwards++;}})),{message:'Invalid model request ceiling'});assert.equal(forwards,0);assert.equal(f.calls.length,0);}
+});
+test('configured single-request ceiling is enforced without raising the default',async()=>{
+ let count=0,forwards=0;const f=fake({script:({emit})=>emit(request(1)),input:({frame,emit})=>{if(frame.type==='end')emit(request(++count+1));}});await assert.rejects(runEngine(args(f,{job:{id:randomUUID(),model,requestLimit:1},gateway:async()=>{forwards++;return new Response('');}})),{message:'Security scan model-request ceiling reached'});assert.equal(forwards,1);
 });
 test('provider errors are sanitized and never attempt fallback',async()=>{
  const f=fake({script:({emit})=>emit(request())});let calls=0;

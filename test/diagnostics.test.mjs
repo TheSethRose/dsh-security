@@ -8,6 +8,10 @@ test('retention caps actual entries at 128 and accounts for dropped entries with
  assert.equal(job.diagnostics.length,128);assert.equal(job.diagnosticsDropped,3);assert.equal(job.diagnostics.at(-1).sequence,127);
  job.diagnosticsDropped=Number.MAX_SAFE_INTEGER;assert.equal(retainDiagnostic(job,{sequence:132}),false);assert.equal(job.diagnosticsDropped,Number.MAX_SAFE_INTEGER);
 });
+test('terminal engine diagnosis survives 500 gateway outcomes without expanding retention',()=>{
+ const job={};for(let n=0;n<500;n++)retainDiagnostic(job,{kind:'gateway',sequence:n});assert.equal(job.diagnosticsDropped,372);
+ const terminal={kind:'engine',engineFailureHint:'request_limit',requestLimit:500};assert.equal(retainDiagnostic(job,terminal),true);assert.equal(job.diagnostics.length,128);assert.equal(job.diagnosticsDropped,373);assert.equal(job.diagnostics.at(-1),terminal);assert.equal(job.diagnostics[0].sequence,1);
+});
 test('explicit private capture preserves unfamiliar rejection verbatim without leaking into normal diagnostics',async()=>{
  const message='400: '+JSON.stringify({error:{message:'An unfamiliar provider explanation '+secret,code:'private_unknown_code'}});
  for(const kind of ['prepare','dispatch','iterate']){

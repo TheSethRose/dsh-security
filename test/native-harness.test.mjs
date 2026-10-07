@@ -94,7 +94,7 @@ for(const mixed of [false,true,'empty-text','empty-reasoning','interleaved','lat
     return response;
   }}),error=>{engineFailure=error;return true;});
   if(mixed){
-    assert.equal(nativeReplay?.length,mixed==='late-reasoning-only'?3:mixed==='namespaced'?5:4);
+    assert.equal(nativeReplay?.length,mixed==='late-reasoning-only'?3:mixed==='namespaced'?5:4,'Offline native replay did not reach the second request: '+JSON.stringify({requests,responses,failure:engineFailure?.message}));
     if(mixed==='late-reasoning')assert.deepEqual(nativeReplay.map(i=>i.type),['message','function_call','function_call','reasoning']);
     const reasoning=nativeReplay.find(i=>i.type==='reasoning'),message=nativeReplay.find(i=>i.type==='message');
     assert.equal(reasoning.content,null);
