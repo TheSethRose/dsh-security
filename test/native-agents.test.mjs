@@ -5,6 +5,7 @@ import path from 'node:path';
 import {mkdtemp,readFile,writeFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
+import {setTimeout as delay} from 'node:timers/promises';
 import {runEngine} from '../transport.mjs';
 import {createHarnessGateway} from '../harness-gateway.mjs';
 import {subprocess} from './adapter.mjs';
@@ -95,4 +96,23 @@ for(const forkTurns of ['none','all'])test(`real native V2 spawn, notification, 
   assert.ok(agents.some(a=>a.author==='/root/offline_worker'&&a.recipient==='/root'&&a.fixtureHeader===prefixAnswer('offline-child-result')),evidence);
   assert.ok(agents.some(a=>a.author==='/root/offline_worker'&&a.recipient==='/root'&&a.fixtureHeader===prefixAnswer('offline-followup-result')),evidence);
   assert.equal(diagnostics.filter(d=>d.outcome==='failed'&&d.code==='PROTOCOL_ERROR').length,0,evidence);
+});
+test('real native root plus four workers queues behind four provider slots (offline)',{skip:!enabled,timeout:90000},async()=>{
+ const repo=await mkdtemp(path.join(os.tmpdir(),'security-native-queue-')),state=await mkdtemp(path.join(os.tmpdir(),'security-native-queue-state-'));
+ await writeFile(path.join(repo,'example.py'),'print("offline queue fixture")\n');execFileSync('/usr/bin/git',['init','--quiet',repo]);
+ const image=JSON.parse(await readFile(new URL('../image.json',import.meta.url),'utf8')).image,selection={provider:'offline-configured-oauth',model:'fixture-native-model'};
+ const diagnostics=[],collaboration=[],children=new Set(),returned=new Set();let spawned=false,notificationSent=false;
+ const nativeTool=(options,name)=>{const raw=collaboration.find(t=>t.name===name),tool=options.tools.find(t=>t.description===raw?.description);assert.ok(tool,'Native collaboration tool required: '+name);return tool;};
+ const gateway=createHarnessGateway({selection,onDiagnostic:d=>diagnostics.push(d),llm:{async prepareCall(config){assert.deepEqual(config,selection);return {config,stream:async function*(options){
+  const users=options.messages.filter(m=>m.role==='user'),delegated=users.flatMap(m=>m.content).map(p=>p.text??'').find(value=>/^Message Type: NEW_TASK\nTask name: \/root\/queue_worker_[1-4]\n/.test(value));
+  if(delegated){const actor=/Task name: (\/root\/queue_worker_[1-4])\n/.exec(delegated)[1];children.add(actor);await delay(2000);yield* text('offline-queue-result-'+actor);return;}
+  if(!spawned){spawned=true;const tool=nativeTool(options,'spawn_agent');for(let n=1;n<=4;n++){const index=n-1,id='offline-queue-spawn-'+n,argumentsText=JSON.stringify({task_name:'queue_worker_'+n,fork_turns:'none',message:'Offline queued task: reply with one line, without commands or delegation.'});yield {type:'block-start',index,blockType:'tool-call'};yield {type:'tool-call-delta',index,id,name:tool.name,argumentsDelta:argumentsText};yield {type:'block-end',index,block:{type:'tool-call',id,name:tool.name,arguments:argumentsText}};}yield {type:'finish',reason:{kind:'tool-calls'}};return;}
+  for(const value of users.flatMap(m=>m.content).map(p=>p.text??'')){const match=/^Message Type: FINAL_ANSWER\nTask name: \/root\nSender: (\/root\/queue_worker_[1-4])\nPayload:\noffline-queue-result-\1$/.exec(value);if(match)returned.add(match[1]);}
+  if(returned.size===4)throw Error('Offline adapter intentionally stops after all four worker returns');
+  if(!notificationSent){notificationSent=true;yield* call(nativeTool(options,'send_message'),{target:'/root/queue_worker_1',message:'Offline owned queue notification.'},'offline-queue-notification');return;}
+  yield* call(nativeTool(options,'wait_agent'),{timeout_ms:1000},'offline-queue-wait-'+diagnostics.length);
+ }}}}});
+ await assert.rejects(runEngine({subprocess,docker:'/usr/local/bin/docker',image,repo,state,job:{id:randomUUID(),operation:'scan',mode:'standard',model:selection.model,minutes:1},signal:AbortSignal.timeout(60000),onDiagnostic:d=>diagnostics.push(d),gateway:(body,signal)=>{collaboration.push(...(body.tools??[]).flatMap(t=>t.type==='namespace'&&t.name==='collaboration'?t.tools:t.namespace==='collaboration'?[t]:[]));return gateway(body,signal);}}));
+ const engine=diagnostics.find(d=>d.kind==='engine'),evidence=JSON.stringify(diagnostics.filter(d=>d.outcome==='failed'));
+ assert.equal(children.size,4,evidence);assert.equal(returned.size,4,evidence);assert.equal(engine.peakActive,4,evidence);assert.ok(engine.queuedRequests>=1,JSON.stringify(engine));assert.ok(engine.peakQueued>=1,JSON.stringify(engine));assert.equal(diagnostics.filter(d=>d.outcome==='failed'&&d.code==='PROTOCOL_ERROR').length,0,evidence);
 });

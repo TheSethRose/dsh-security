@@ -21,6 +21,49 @@ test('native ownership failures produce a fixed engine hint without retaining st
  const entries=[],secret='PRIVATE-STATE-PATH-CANARY',f=fake({script:({finish})=>finish(1),stderr:'Scan output directory must be owned by the current user: /state/'+secret});await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d)})));assert.equal(entries.length,1);assert.equal(entries[0].diagnosticVersion,2);assert.equal(entries[0].engineFailureHint,'state_directory_ownership');assert.equal(entries[0].requestCount,0);assert.ok(!JSON.stringify(entries).includes(secret));
 });
 
+test('queued native requests remain FIFO even when a new frame arrives during slot release',{timeout:3000},async()=>{
+ const gates=Array.from({length:7},deferred),entered=Array.from({length:7},deferred),order=[],entries=[];let ended=0;
+ const numbered=n=>request(n,{body:JSON.stringify({model,input:String(n)})});
+ const f=fake({script:({emit})=>{for(let n=1;n<=6;n++)emit(numbered(n));},input:({frame,emit,finish})=>{if(frame.type!=='end')return;if(frame.id===1)emit(numbered(7));if(++ended===7){emit({type:'result',value:'ok'});finish();}}});
+ const task=runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:body=>{const n=Number(body.input);order.push(n);entered[n-1].resolve();return gates[n-1].promise;}}));const settled=task.then(value=>({value}),error=>({error}));
+ await entered[3].promise;assert.deepEqual(order,[1,2,3,4]);
+ for(let n=0;n<3;n++){gates[n].resolve(new Response('fixture'));const next=await Promise.race([entered[n+4].promise.then(()=>({entered:true})),settled]);assert.equal(next.entered,true,next.error?.message);}
+ assert.deepEqual(order,[1,2,3,4,5,6,7]);for(let n=3;n<7;n++)gates[n].resolve(new Response('fixture'));
+ assert.equal(await task,'ok');assert.equal(entries.at(-1).peakActive,4);assert.equal(entries.at(-1).peakQueued,3);assert.equal(entries.at(-1).queuedRequests,3);
+});
+test('queued requests are cancelled without dispatch or cancellation misclassification',{timeout:3000},async()=>{
+ const four=deferred(),controller=new AbortController(),entries=[];let forwards=0;
+ const f=fake({script:({emit})=>{for(let n=1;n<=18;n++)emit(request(n));}});
+ const task=runEngine(args(f,{signal:controller.signal,onDiagnostic:d=>entries.push(d),gateway:()=>{if(++forwards===4)four.resolve();return new Promise(()=>{});}}));const rejected=assert.rejects(task,/cancel/i);
+ await four.promise;controller.abort();await rejected;assert.equal(forwards,4);assert.equal(entries.at(-1).outcome,'cancelled');assert.equal(entries.at(-1).peakQueued,14);assert.equal(entries.at(-1).queuedRequests,14);assert.equal(f.calls.at(-1)[0],'rm');
+});
+test('the existing 180-second request deadline includes queue wait',{timeout:3000},async t=>{
+ const deadlines=[],nativeTimeout=AbortSignal.timeout,four=deferred(),entries=[];let forwards=0;
+ t.mock.method(AbortSignal,'timeout',milliseconds=>{if(milliseconds!==180000)return nativeTimeout(milliseconds);const controller=new AbortController();deadlines.push(controller);return controller.signal;});
+ const f=fake({script:({emit})=>{for(let n=1;n<=5;n++)emit(request(n));}});
+ const task=runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{if(++forwards===4)four.resolve();return new Promise(()=>{});}}));const rejected=assert.rejects(task,/Model request deadline reached/);
+ await four.promise;assert.equal(deadlines.length,5);deadlines[4].abort(new DOMException('Offline queued deadline','TimeoutError'));await rejected;
+ assert.equal(forwards,4);assert.equal(entries.at(-1).engineFailureHint,'request_deadline');assert.equal(entries.at(-1).peakQueued,1);assert.equal(entries.at(-1).outcome,'failed');assert.equal(f.calls.at(-1)[0],'rm');
+});
+test('successful engine shutdown cancels unused queued work without inventing an adapter failure',{timeout:3000},async()=>{
+ const entries=[];let forwards=0;const f=fake({script:({emit,finish})=>{for(let n=1;n<=5;n++)emit(request(n));setImmediate(()=>{emit({type:'result',value:'ok'});finish();});}});
+ assert.equal(await runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{forwards++;return new Promise(()=>{});}})),'ok');assert.equal(forwards,4);assert.equal(entries.at(-1).outcome,'completed');assert.equal(entries.at(-1).peakQueued,1);
+});
+test('queue count is bounded separately from total requests and active forwards',{timeout:3000},async()=>{
+ const entries=[];let forwards=0;const f=fake({script:({emit})=>{for(let n=1;n<=21;n++)emit(request(n));}});
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{forwards++;return new Promise(()=>{});}})),/queue count limit/);
+ assert.ok(forwards<=4);assert.equal(entries.at(-1).requestCount,21);assert.equal(entries.at(-1).peakQueued,16);assert.equal(entries.at(-1).queuedRequests,16);assert.equal(entries.at(-1).engineFailureHint,'request_queue_count_limit');
+});
+test('queued serialized request bytes are bounded without retaining source in diagnostics',{timeout:10000},async()=>{
+ const secret='PRIVATE-QUEUED-TEXT-CANARY',body=JSON.stringify({model,input:secret+'x'.repeat(12*1024*1024)}),entries=[];let forwards=0;
+ const f=fake({script:({emit})=>{for(let n=1;n<=10;n++)emit(request(n,n>4?{body}:{}));}});
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{forwards++;return new Promise(()=>{});}})),/queue byte limit/);
+ assert.ok(forwards<=4);assert.equal(entries.at(-1).peakQueued,5);assert.ok(entries.at(-1).peakQueuedBytes<=64*1024*1024);assert.equal(entries.at(-1).engineFailureHint,'request_queue_bytes_limit');assert.ok(!JSON.stringify(entries).includes(secret));
+});
+test('invalid queued request fails validation before reserving queue capacity',{timeout:3000},async()=>{
+ const entries=[];let forwards=0;const f=fake({script:({emit})=>{for(let n=1;n<=4;n++)emit(request(n));emit(request(5,{body:JSON.stringify({model:'foreign',input:'fixture'})}));}});
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{forwards++;return new Promise(()=>{});}})),/Model mismatch/);assert.ok(forwards<=4);assert.equal(entries.at(-1).peakQueued,0);assert.equal(entries.at(-1).queuedRequests,0);
+});
 test('container creation has a managed 30-second client deadline',async()=>{
  let bounded=false;const f=fake({command:(a,spec)=>{if(a[0]==='create'){bounded=spec.signal instanceof AbortSignal;assert.equal(spec.signal.aborted,false);}},script:({emit,finish})=>{emit({type:'result',value:'ok'});finish();}});
  assert.equal(await runEngine(args(f)),'ok');assert.equal(bounded,true);
@@ -53,13 +96,18 @@ test('gateway preparation and wedged stdin cannot prevent cancellation/cleanup',
  const controller=new AbortController(),waiting=deferred(),f=fake({wedgeWrites:true,script:({emit})=>emit(request())});
  const task=runEngine(args(f,{signal:controller.signal,gateway:()=>waiting.promise}));await f.ready;controller.abort();await assert.rejects(task,/cancel/i);assert.equal(f.calls.at(-1)[0],'rm');waiting.resolve(new Response('late'));
 });
-test('fifth simultaneous request terminates without forwarding extra work',{timeout:3000},async()=>{
- let forwards=0;const f=fake({script:({emit})=>{for(let n=1;n<=5;n++)emit(request(n));}});
- await assert.rejects(runEngine(args(f,{gateway:async()=>{forwards++;return new Promise(()=>{});}})),/limit exceeded/);assert.ok(forwards<=4);assert.equal(f.calls.at(-1)[0],'rm');
+test('fifth simultaneous request waits without exceeding four active forwards',{timeout:3000},async()=>{
+ const gates=Array.from({length:5},deferred),four=deferred(),fifth=deferred(),entries=[];let forwards=0,ended=0;
+ const f=fake({script:({emit})=>{for(let n=1;n<=5;n++)emit(request(n));},input:({frame,emit,finish})=>{if(frame.type==='end'&&++ended===5){emit({type:'result',value:'ok'});finish();}}});
+ const task=runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:()=>{const n=forwards++;if(forwards===4)four.resolve();if(forwards===5)fifth.resolve();return gates[n].promise;}}));
+ const settled=task.then(value=>({value}),error=>({error}));await four.promise;assert.equal(forwards,4);gates[0].resolve(new Response('first'));
+ const next=await Promise.race([fifth.promise.then(()=>({entered:true})),settled]);assert.equal(next.entered,true,next.error?.message);
+ for(let n=1;n<5;n++)gates[n].resolve(new Response('next'));
+ assert.equal(await task,'ok');assert.equal(forwards,5);assert.equal(entries.at(-1).peakActive,4);assert.equal(entries.at(-1).peakQueued,1);assert.equal(entries.at(-1).queuedRequests,1);assert.ok(entries.at(-1).peakQueuedBytes>0);assert.equal(f.calls.at(-1)[0],'rm');
 });
 test('101st sequential request exceeds the total request ceiling',{timeout:3000},async()=>{
- let count=0;const f=fake({script:({emit})=>emit(request(1)),input:({frame,emit})=>{if(frame.type==='end')emit(request(++count+1));}});let forwards=0;
- await assert.rejects(runEngine(args(f,{gateway:async()=>{forwards++;return new Response('');}})),/limit exceeded/);assert.equal(forwards,100);
+ let count=0;const entries=[],f=fake({script:({emit})=>emit(request(1)),input:({frame,emit})=>{if(frame.type==='end')emit(request(++count+1));}});let forwards=0;
+ await assert.rejects(runEngine(args(f,{onDiagnostic:d=>entries.push(d),gateway:async()=>{forwards++;return new Response('');}})),/limit exceeded/);assert.equal(forwards,100);assert.equal(entries.at(-1).engineFailureHint,'request_limit');
 });
 test('provider errors are sanitized and never attempt fallback',async()=>{
  const f=fake({script:({emit})=>emit(request())});let calls=0;
